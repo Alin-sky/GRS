@@ -1,0 +1,140 @@
+/**
+ * 内核事件注册表（src/host-api/event-registry.js）
+ *
+ * ★ 事件名与 payload 形状属于契约，不允许插件层或核心层硬编码字面量（修 C02 隐式契约）。
+ *   核心发事件、插件订事件，双方都从这里取名字。
+ *
+ * 设计依据：docs/architecture-2026-09-14.md §3.4
+ *
+ * | 事件                        | 模式    | payload                              | 返回值 schema                |
+ * |-----------------------------|---------|--------------------------------------|------------------------------|
+ * | moderation:image:tag        | collect | (imageBase64)                        | ModerationTagContribution    |
+ * | moderation:image:linkage    | first   | (result: Verdict, contributions[])   | ModerationVerdict            |
+ */
+const { CAPABILITIES, OUTPUT_SCHEMAS } = require('./contract');
+
+/** 收集模式：并行执行全部处理器，收集非空返回值 */
+const MODE_COLLECT = 'collect';
+/** 短路模式：按 order 顺序执行，首个非空返回值即为结果 */
+const MODE_FIRST = 'first';
+
+/** 事件名常量（唯一来源） */
+const EVENTS = Object.freeze({
+  /** 图片标签收集（wd14 → 标签贡献） */
+  IMAGE_TAG: 'moderation:image:tag',
+  /** 图片审核联动判定（首个非空返回即最终判定） */
+  IMAGE_LINKAGE: 'moderation:image:linkage',
+});
+
+/**
+ * 事件定义表：event → { mode, payload, outputSchema, capability, maxOutputBytes? }
+ * payload 为参数名列表（仅作文档与校验提示，不做运行时强校验以免影响既有插件）。
+ */
+const REGISTRY = Object.freeze({
+  [EVENTS.IMAGE_TAG]: {
+    mode: MODE_COLLECT,
+    payload: ['imageBase64'],
+    outputSchema: OUTPUT_SCHEMAS.MODERATION_TAG_CONTRIBUTION,
+    capability: CAPABILITIES.IMAGE_TAG,
+  },
+  [EVENTS.IMAGE_LINKAGE]: {
+    mode: MODE_FIRST,
+    payload: ['result', 'contributions'],
+    outputSchema: OUTPUT_SCHEMAS.MODERATION_VERDICT,
+    capability: CAPABILITIES.IMAGE_LINKAGE,
+  },
+});
+
+/** 事件名集合 */
+const EVENT_NAMES = Object.freeze(Object.keys(REGISTRY));
+
+/**
+ * 取事件定义。
+ * @param {string} event 事件名
+ * @returns {object|null} 事件定义或 null
+ */
+function getEvent(event) {
+  return Object.prototype.hasOwnProperty.call(REGISTRY, event) ? REGISTRY[event] : null;
+}
+
+/**
+ * 事件是否已在注册表声明。
+ * @param {string} event 事件名
+ * @returns {boolean}
+ */
+function isKnownEvent(event) {
+  return Object.prototype.hasOwnProperty.call(REGISTRY, event);
+}
+
+/**
+ * 取事件声明的模式（未知事件返回 null）。
+ * @param {string} event 事件名
+ * @returns {'collect'|'first'|null}
+ */
+function modeOf(event) {
+  const def = getEvent(event);
+  return def ? def.mode : null;
+}
+
+/**
+ * 校验某事件的返回值所用输出 schema 名。
+ * @param {string} event 事件名
+ * @returns {string|null}
+ */
+function outputSchemaOf(event) {
+  const def = getEvent(event);
+  return def ? def.outputSchema : null;
+}
+
+/**
+ * 由能力 id 反查其绑定的事件名。
+ * @param {string} capabilityId 能力 id
+ * @returns {string|null}
+ */
+function eventOfCapability(capabilityId) {
+  for (const [event, def] of Object.entries(REGISTRY)) {
+    if (def.capability === capabilityId) return event;
+  }
+  return null;
+}
+
+/**
+ * 校验插件声明的能力项是否与注册表一致（能力 id / 事件名 / 模式 / 输出 schema）。
+ * @param {object} capability manifest.contributes.capabilities[i]
+ * @returns {{ok: boolean, errors: string[], event?: string}}
+ */
+function validateCapability(capability) {
+  const errors = [];
+  if (!capability || typeof capability !== 'object') {
+    return { ok: false, errors: ['能力声明必须是对象'] };
+  }
+  const expectedEvent = eventOfCapability(capability.id);
+  if (!expectedEvent) {
+    return { ok: false, errors: [`未知能力 id：${capability.id}`] };
+  }
+  const def = getEvent(expectedEvent);
+  if (capability.event !== undefined && capability.event !== expectedEvent) {
+    errors.push(`能力 ${capability.id} 的事件名应为 ${expectedEvent}，实际为 ${capability.event}`);
+  }
+  if (capability.mode !== undefined && capability.mode !== def.mode) {
+    errors.push(`能力 ${capability.id} 的模式应为 ${def.mode}，实际为 ${capability.mode}`);
+  }
+  if (capability.outputSchema !== undefined && capability.outputSchema !== def.outputSchema) {
+    errors.push(`能力 ${capability.id} 的输出 schema 应为 ${def.outputSchema}，实际为 ${capability.outputSchema}`);
+  }
+  return { ok: errors.length === 0, errors, event: expectedEvent };
+}
+
+module.exports = {
+  MODE_COLLECT,
+  MODE_FIRST,
+  EVENTS,
+  REGISTRY,
+  EVENT_NAMES,
+  getEvent,
+  isKnownEvent,
+  modeOf,
+  outputSchemaOf,
+  eventOfCapability,
+  validateCapability,
+};

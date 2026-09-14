@@ -1,0 +1,467 @@
+/**
+ * 选项冲突治理 —— 声明式冲突矩阵（架构 §4）
+ *
+ * 目标：把散落各处的 `if` 判断收敛成**一份声明式规则表**，启动时统一检测、
+ * 统一输出、统一给出「实际生效值」，避免「选了 A 又选 B，到底哪个生效」的模糊体验。
+ *
+ * 三类处置：
+ *   block —— 拒绝启动（仅用于致命组合，如端口非法）
+ *   auto  —— 自动修正 + WARN，并在报告里写清「实际生效值」
+ *   warn  —— 只提示风险，不改配置（需要人来决定）
+ *
+ * 本模块**不依赖 config.js**（避免循环依赖）：占位符判定从 config-defaults 取，
+ * 日志通过 `options.log` 注入，因此可独立单元测试。
+ *
+ * 统一文案（§4.3）三条要求：
+ *   ① 带规则 ID（便于检索文档） ② 说明实际生效值 ③ 给出消除方法
+ */
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { isValueSet: defaultIsValueSet } = require('./config-defaults');
+
+/**
+ * 深写补丁：按 'a.b.c' 路径写入值。
+ * @param {object} target 目标对象（原地修改）
+ * @param {Array<[string, *]>} entries [路径, 值] 列表
+ */
+function applyPatch(target, entries) {
+  for (const [configPath, value] of entries) {
+    const keys = configPath.split('.');
+    let cursor = target;
+    let ok = true;
+    for (let i = 0; i < keys.length - 1; i++) {
+      if (!cursor[keys[i]] || typeof cursor[keys[i]] !== 'object') { ok = false; break; }
+      cursor = cursor[keys[i]];
+    }
+    if (ok) cursor[keys[keys.length - 1]] = value;
+  }
+}
+
+/**
+ * 读取配置里可能不存在的嵌套字段。
+ * @param {object} cfg 配置对象
+ * @param {string} configPath 路径
+ * @param {*} fallback 兜底值
+ * @returns {*} 字段值
+ */
+function pick(cfg, configPath, fallback) {
+  const keys = configPath.split('.');
+  let cursor = cfg;
+  for (const key of keys) {
+    if (cursor === undefined || cursor === null || typeof cursor !== 'object') return fallback;
+    cursor = cursor[key];
+  }
+  return cursor === undefined ? fallback : cursor;
+}
+
+/**
+ * 判断本地视觉模型能否用于图片审核。
+ * @param {object} cfg 配置
+ * @param {Function} isSet 占位符判定
+ * @returns {boolean} 是否可用
+ */
+function localVisionUsable(cfg, isSet) {
+  if (pick(cfg, 'moderationMode', 'local') === 'cloud-only') return false;
+  if (pick(cfg, 'ollama.enabled', true) === false) return false;
+  if (pick(cfg, 'moderation.reviewChannels.local', true) === false) return false;
+  return isSet(pick(cfg, 'ollama.visionModel', ''));
+}
+
+/**
+ * 判断云端视觉模型能否用于图片审核。
+ * @param {object} cfg 配置
+ * @param {Function} isSet 占位符判定
+ * @returns {boolean} 是否可用
+ */
+function cloudVisionUsable(cfg, isSet) {
+  if (pick(cfg, 'qwenCloud.enabled', false) !== true) return false;
+  if (pick(cfg, 'qwenCloud.visionEnabled', false) !== true) return false;
+  const billing = pick(cfg, 'qwenCloud.billingSource', 'dashscope');
+  const key = billing === 'token-plan'
+    ? pick(cfg, 'tokenPlan.apiKey', '')
+    : pick(cfg, 'qwenCloud.apiKey', '');
+  return isSet(key);
+}
+
+// ══════════════════════════════════════════════════════════
+// 冲突规则表（架构 §4.1 X01–X13 + 批量扫描/插件补充 X14–X16）
+// ══════════════════════════════════════════════════════════
+/**
+ * @typedef {'block'|'auto'|'warn'} Resolution
+ * @typedef {{
+ *   id: string,
+ *   title: string,
+ *   severity: 'error'|'warn',
+ *   when: (c: object, ctx: object) => boolean,
+ *   resolution: Resolution,
+ *   message: (c: object, ctx: object) => string,
+ *   fix: string,
+ *   patch?: (c: object, ctx: object) => Array<[string, *]>
+ * }} ConflictRule
+ */
+
+/** @type {ConflictRule[]} */
+const CONFLICT_RULES = [
+  {
+    id: 'X01',
+    title: 'cloud-only 模式却关闭了云端通道',
+    severity: 'error',
+    resolution: 'auto',
+    when: (c) => pick(c, 'moderationMode', 'local') === 'cloud-only'
+      && pick(c, 'moderation.reviewChannels.cloud', true) === false,
+    message: () => '云端轻量模式要求启用云端通道，但 reviewChannels.cloud=false；已回落为 local 模式。'
+      + '如需纯云端，请将 reviewChannels.cloud 置为 true 或改用 moderationMode=\'local\'',
+    fix: 'moderationMode',
+    patch: () => [['moderationMode', 'local']],
+  },
+  {
+    id: 'X02',
+    title: '三个审核通道全部关闭',
+    severity: 'error',
+    resolution: 'auto',
+    when: (c) => pick(c, 'moderation.reviewChannels.local', true) === false
+      && pick(c, 'moderation.reviewChannels.cloud', true) === false
+      && pick(c, 'moderation.reviewChannels.contentSafety', false) === false,
+    message: () => '三个审核通道全部关闭，审核结果将仅基于预检层（敏感词），'
+      + '且不会再有任何 AI 通道参与（实际生效：仅预检）。请至少启用一个通道',
+    fix: 'moderation.reviewChannels.*',
+    patch: () => [['moderation.notConfigured', true]],
+  },
+  {
+    id: 'X03',
+    title: 'dualMode 与 doubleCheck 互斥',
+    severity: 'warn',
+    resolution: 'auto',
+    when: (c) => pick(c, 'moderation.dualMode', false) === true
+      && pick(c, 'moderation.doubleCheck', false) === true,
+    message: () => 'dualMode 与 doubleCheck 互斥，已忽略 doubleCheck（实际生效：dualMode）',
+    fix: 'moderation.doubleCheck',
+    patch: () => [['moderation.doubleCheck', false]],
+  },
+  {
+    id: 'X04',
+    title: '宽松模式与涉政/暴恐类目冲突',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c) => pick(c, 'moderation.strictness', 'standard') === 'relaxed'
+      && (pick(c, 'moderation.thresholds.political.enabled', true) === true
+        || pick(c, 'moderation.thresholds.violence.enabled', true) === true),
+    message: () => '宽松模式下涉政/暴恐类目仍按 critical 处理，不接受阈值放宽'
+      + '（实际生效：这两类不受 relaxed 影响）。若确需全局放宽，请显式关闭对应类目',
+    fix: 'moderation.thresholds.political.enabled / moderation.thresholds.violence.enabled',
+  },
+  {
+    id: 'X05',
+    title: '额度来源与 Key 不匹配',
+    severity: 'warn',
+    resolution: 'auto',
+    when: (c, ctx) => pick(c, 'qwenCloud.billingSource', 'dashscope') === 'token-plan'
+      && !ctx.isValueSet(pick(c, 'tokenPlan.apiKey', '')),
+    message: (c) => `额度来源为 token-plan 但未配置 tokenPlan.apiKey，已回落 ${'dashscope'}`
+      + '（实际生效：dashscope 按量计费！）。请确认是否会产生费用',
+    fix: 'qwenCloud.billingSource 或 tokenPlan.apiKey',
+    patch: () => [['qwenCloud.billingSource', 'dashscope']],
+  },
+  {
+    id: 'X06',
+    title: '双审模式但一侧通道未配置',
+    severity: 'warn',
+    resolution: 'auto',
+    when: (c, ctx) => pick(c, 'moderation.dualMode', false) === true
+      && !(ctx.localUsable && ctx.cloudUsable),
+    message: (c, ctx) => {
+      const missing = [];
+      if (!ctx.localUsable) missing.push('本地');
+      if (!ctx.cloudUsable) missing.push('云端');
+      return `双审模式已开启，但${missing.join('、')}通道未配置，本次等效为单通道审核`
+        + `（实际生效：${ctx.localUsable ? '本地' : ctx.cloudUsable ? '云端' : '无（仅预检）'}）`;
+    },
+    fix: 'moderation.dualMode（关闭它可消除提示）或补全缺失通道的配置',
+  },
+  {
+    id: 'X07',
+    title: '内容安全已启用但 AccessKey 为占位符',
+    severity: 'warn',
+    resolution: 'auto',
+    when: (c, ctx) => pick(c, 'contentSafety.enabled', false) === true
+      && !(ctx.isValueSet(pick(c, 'contentSafety.accessKeyId', ''))
+        && ctx.isValueSet(pick(c, 'contentSafety.accessKeySecret', ''))),
+    message: () => '内容安全已启用但 AccessKey 为占位符/空，已按未配置处理并静默跳过'
+      + '（实际生效：contentSafety.enabled=false）',
+    fix: 'contentSafety.accessKeyId / contentSafety.accessKeySecret 或 contentSafety.enabled',
+    patch: () => [['contentSafety.enabled', false]],
+  },
+  {
+    id: 'X08',
+    title: '未设置管理员口令',
+    severity: 'error',
+    resolution: 'warn',
+    when: (c, ctx) => !ctx.isValueSet(pick(c, 'adminPassword', '')),
+    message: () => '未设置管理员口令，所有写接口已禁用（实际生效：写接口返回 403）',
+    fix: 'adminPassword（也可用环境变量 ADMIN_PASSWORD）',
+  },
+  {
+    id: 'X09',
+    title: '未设置词库口令',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c, ctx) => !ctx.isValueSet(pick(c, 'wordDbPassword', '')),
+    message: () => '未设置词库口令，词库写接口已禁用（实际生效：词库写接口返回 403）',
+    fix: 'wordDbPassword',
+  },
+  {
+    id: 'X10',
+    title: '每日对比审核已开启但无可对比模型',
+    severity: 'warn',
+    resolution: 'auto',
+    when: (c, ctx) => pick(c, 'ollama.comparisonEnabled', false) === true
+      && !(ctx.localUsable && Array.isArray(pick(c, 'ollama.comparisonModels', []))
+        && pick(c, 'ollama.comparisonModels', []).length > 0),
+    message: () => '每日对比审核已开启但无可对比模型，已自动禁用（实际生效：comparisonEnabled=false）',
+    fix: 'ollama.comparisonEnabled 或 ollama.comparisonModels',
+    patch: () => [['ollama.comparisonEnabled', false]],
+  },
+  {
+    id: 'X11',
+    title: '本地与云端通道均不可用',
+    severity: 'error',
+    resolution: 'warn',
+    when: (c, ctx) => pick(c, 'ollama.enabled', true) === false
+      && pick(c, 'moderationMode', 'local') !== 'cloud-only'
+      && !ctx.cloudConfigured,
+    message: () => '本地与云端通道均不可用，服务以预检模式运行（实际生效：仅敏感词预检，结果标记 degraded）',
+    fix: 'ollama.enabled / qwenCloud.apiKey（至少配一个通道）',
+  },
+  {
+    id: 'X12',
+    title: 'onAiFailure 取值非法',
+    severity: 'error',
+    resolution: 'auto',
+    when: (c) => {
+      const v = pick(c, 'moderation.onAiFailure', 'block');
+      return v !== 'block' && v !== 'review';
+    },
+    message: (c) => `onAiFailure='${String(pick(c, 'moderation.onAiFailure', ''))}' 取值非法，`
+      + '已回落为安全的 block（实际生效：block）',
+    fix: 'moderation.onAiFailure（只能是 block 或 review）',
+    patch: () => [['moderation.onAiFailure', 'block']],
+  },
+  {
+    id: 'X13',
+    title: '服务端口非法',
+    severity: 'error',
+    resolution: 'block',
+    when: (c) => {
+      const port = Number(pick(c, 'server.port', 11451));
+      return !Number.isInteger(port) || port < 1 || port > 65535;
+    },
+    message: (c) => `端口 ${String(pick(c, 'server.port', ''))} 不可用：取值必须在 1-65535 之间`,
+    fix: 'server.port（或环境变量 MOD_PORT）',
+  },
+  {
+    id: 'X14',
+    title: '启用批量扫描但没有可用的图片通道',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c, ctx) => {
+      const batchEnabled = ctx.isValueSet(pick(c, 'batch.autoScanFolder', ''))
+        || pick(c, 'batch.enabled', false) === true;
+      if (!batchEnabled) return false;
+      return !ctx.localVisionUsable && !ctx.cloudVisionUsable;
+    },
+    message: (c) => '批量扫描已启用，但本地视觉模型与云端视觉模型都不可用；'
+      + '扫描任务不会中断，但每张图都会按失败-关闭策略标记为「需人工复核」'
+      + '（实际生效：imagePolicy=review）',
+    fix: 'ollama.visionModel 或 qwenCloud.visionEnabled + 视觉模型 Key，或关闭 batch.autoScanFolder',
+  },
+  {
+    id: 'X15',
+    title: '批量扫描严格程度与实时审核不一致',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c, ctx) => {
+      const batchStrictness = pick(c, 'batch.autoScanStrictness', '');
+      if (!ctx.isValueSet(batchStrictness)) return false;
+      return batchStrictness !== pick(c, 'moderation.strictness', 'standard');
+    },
+    message: (c) => `批量扫描严格程度(${String(pick(c, 'batch.autoScanStrictness', ''))}) `
+      + `与实时审核严格程度(${String(pick(c, 'moderation.strictness', 'standard'))}) 不一致，`
+      + '同一张图在两条链路上可能得到不同结论（实际生效：各自按自己的设置执行）',
+    fix: 'batch.autoScanStrictness 或 moderation.strictness（改为一致）',
+  },
+  {
+    id: 'X16',
+    title: '插件能力与权限不符',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c) => {
+      const plugins = pick(c, 'plugins', null);
+      // 只有显式配置了 plugins 段落才检测（避免在未接入插件配置时误报）
+      if (!plugins || typeof plugins !== 'object') return false;
+      if (plugins.enabled === false) return false;
+      const perms = plugins.permissions;
+      if (!Array.isArray(perms)) return false;
+      const wd14On = pick(c, 'wd14.enabled', true) !== false;
+      // WD14 标签器要贡献图片标签，必须有 image:tag 能力
+      return wd14On && !perms.includes('image:tag');
+    },
+    message: () => 'WD14 标签器已启用，但插件权限清单缺少 "image:tag"，'
+      + '标签贡献会被权限闸门拒绝（实际生效：图片标签联动降级为无操作）',
+    fix: 'plugins.permissions（加入 "image:tag"）或 wd14.enabled',
+  },
+];
+
+/**
+ * 把「配置路径」翻译成统一的消除方法文案。
+ * @param {ConflictRule} rule 规则
+ * @returns {string} 消除方法
+ */
+function buildFixHint(rule) {
+  return `修改 config/default.json 的 ${rule.fix} 可消除此提示`;
+}
+
+/**
+ * 启动期检测：返回报告并对 config 施加自动修正。
+ *
+ * @param {object} cfg 已深合并 + 已应用环境变量的配置对象（原地修改）
+ * @param {object} [options] 选项
+ * @param {(v: *) => boolean} [options.isValueSet] 占位符判定（默认用 config-defaults 实现）
+ * @param {(level: string, message: string) => void} [options.log] 日志输出（默认 console）
+ * @returns {{rules: ConflictRule[], reports: Array<object>, patched: object, blocking: Array<object>}}
+ */
+function detectConflicts(cfg, options = {}) {
+  const isSet = typeof options.isValueSet === 'function' ? options.isValueSet : defaultIsValueSet;
+  const log = typeof options.log === 'function'
+    ? options.log
+    : (level, message) => {
+      const line = `[config] ${level === 'error' ? 'ERROR' : 'WARN'}  ${message}`;
+      if (level === 'error') console.error(line);
+      else console.warn(line);
+    };
+
+  const config = cfg && typeof cfg === 'object' ? cfg : {};
+
+  // 供 when/message 共享的上下文（避免每条规则重复推导）
+  const cloudCredentialsSet = (() => {
+    const billing = pick(config, 'qwenCloud.billingSource', 'dashscope');
+    const key = billing === 'token-plan'
+      ? pick(config, 'tokenPlan.apiKey', '')
+      : pick(config, 'qwenCloud.apiKey', '');
+    return isSet(key);
+  })();
+
+  const ctx = {
+    isValueSet: isSet,
+    localUsable: pick(config, 'ollama.enabled', true) !== false
+      && pick(config, 'moderationMode', 'local') !== 'cloud-only'
+      && pick(config, 'moderation.reviewChannels.local', true) !== false
+      && isSet(pick(config, 'ollama.textModel', '')),
+    cloudUsable: (pick(config, 'qwenCloud.enabled', false) === true
+      || pick(config, 'moderationMode', 'local') === 'cloud-only') && cloudCredentialsSet,
+    cloudConfigured: cloudCredentialsSet,
+    localVisionUsable: localVisionUsable(config, isSet),
+    cloudVisionUsable: cloudVisionUsable(config, isSet),
+  };
+
+  const reports = [];
+  const applied = [];
+
+  for (const rule of CONFLICT_RULES) {
+    let hit = false;
+    try {
+      hit = rule.when(config, ctx) === true;
+    } catch {
+      hit = false; // 规则本身出错不得影响启动
+    }
+    if (!hit) continue;
+
+    let message = '';
+    try {
+      message = rule.message(config, ctx);
+    } catch {
+      message = rule.title;
+    }
+
+    const effective = rule.resolution === 'auto'
+      ? '已自动修正'
+      : rule.resolution === 'block'
+        ? '拒绝启动'
+        : '保持原值（仅提示）';
+
+    reports.push({
+      id: rule.id,
+      title: rule.title,
+      severity: rule.severity,
+      resolution: rule.resolution,
+      message,
+      effective,
+      fix: buildFixHint(rule),
+    });
+
+    // 统一文案：带 ID → 实际生效 → 消除方法
+    log(rule.severity, `[${rule.id}] ${message}`);
+    log(rule.severity === 'error' ? 'error' : 'warn', `               → ${buildFixHint(rule)}`);
+
+    if (rule.resolution === 'auto' && typeof rule.patch === 'function') {
+      try {
+        const entries = rule.patch(config, ctx) || [];
+        if (entries.length > 0) {
+          applyPatch(config, entries);
+          applied.push(...entries.map((e) => e[0]));
+        }
+      } catch {
+        // 自动修正失败：保留告警，不影响启动
+      }
+    }
+  }
+
+  if (applied.length > 0) {
+    log('warn', `已自动修正 ${applied.length} 处配置：${applied.join(', ')}`);
+  }
+
+  return {
+    rules: CONFLICT_RULES,
+    reports,
+    patched: { applied },
+    blocking: reports.filter((r) => r.resolution === 'block'),
+  };
+}
+
+/**
+ * 把报告落盘到 logs/startup-<date>.log（架构 §4.3）。
+ * 失败不影响启动。
+ * @param {Array<object>} reports 冲突报告
+ * @param {string} projectRoot 项目根目录
+ */
+function writeStartupLog(reports, projectRoot) {
+  if (!Array.isArray(reports) || reports.length === 0) return;
+  try {
+    const d = new Date();
+    const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const dir = path.join(projectRoot || path.join(__dirname, '..'), 'logs');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const lines = [`# ${new Date().toISOString()} startup config conflicts (${reports.length})`];
+    for (const r of reports) {
+      lines.push(`[${r.id}] ${r.severity.toUpperCase()} ${r.message}`);
+      lines.push(`      -> ${r.fix}`);
+    }
+    lines.push('');
+    fs.appendFileSync(path.join(dir, `startup-${ymd}.log`), `${lines.join('\n')}\n`, 'utf-8');
+  } catch {
+    // 落盘失败不影响启动
+  }
+}
+
+module.exports = {
+  CONFLICT_RULES,
+  detectConflicts,
+  writeStartupLog,
+  buildFixHint,
+  applyPatch,
+  pick,
+  localVisionUsable,
+  cloudVisionUsable,
+};

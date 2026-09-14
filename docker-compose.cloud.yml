@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  qq-moderator:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloud
+    container_name: qq-moderator-cloud
+    restart: unless-stopped
+    ports:
+      - "11451:11451"
+    environment:
+      # 必须填写阿里云 API Key
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - MODERATION_MODE=cloud-only
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-alsnb1919810}
+    volumes:
+      # 持久化审核日志
+      - ./logs:/app/logs
+      - ./data:/app/data
+      # 如需自定义配置，取消下行注释
+      # - ./config:/app/config

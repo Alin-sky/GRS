@@ -1,0 +1,45 @@
+{
+  "id": "wd14-tagger",
+  "name": "WD14 动漫标签预筛",
+  "version": "1.1.0",
+  "description": "通过 WD14 标签器识别动漫图片的裸足/大胸/泳装/色情等特征，并提供可配置的与视觉模型的联动策略",
+  "author": "内置",
+  "license": "MIT",
+  "main": "index.js",
+  "engines": { "node": ">=18" },
+  "host": { "minVersion": "2.0.0" },
+
+  "hostApi": "1.0",
+
+  "services": {
+    "provides": ["wd14", "linkage"],
+    "injects": ["logger"]
+  },
+
+  "contributes": {
+    "config": { "schemaResolver": "configSchema" },
+    "views": [],
+    "capabilities": [
+      {
+        "id": "image.tag",
+        "event": "moderation:image:tag",
+        "mode": "collect",
+        "outputSchema": "ModerationTagContribution"
+      },
+      {
+        "id": "image.linkage",
+        "event": "moderation:image:linkage",
+        "mode": "first",
+        "outputSchema": "ModerationVerdict"
+      }
+    ]
+  },
+
+  "permissions": ["net:local", "rpc"],
+
+  "integrity": { "maxOutputBytes": 8192 },
+
+  "dependencies": {},
+
+  "source": { "type": "builtin" }
+}
