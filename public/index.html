@@ -1994,6 +1994,300 @@ h1, h2, h3, h4 { line-height: var(--lh-tight); }
     scroll-behavior: auto !important;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   审核流程画布（Flow DAG Canvas）
+   渲染方案（架构 §15）：背景 CSS 网格 + 单个 SVG 连线层 + HTML 节点
+   ═══════════════════════════════════════════════════════════════════ */
+.flow-workspace { display: flex; gap: var(--sp-4); align-items: flex-start; }
+.flow-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+.flow-aside { flex: 0 0 318px; width: 318px; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
+
+/* ── 工具栏 ── */
+.flow-toolbar { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.flow-toolbar .grow { flex: 1 1 auto; }
+.flow-seg {
+  display: inline-flex; padding: 3px; gap: 3px; border-radius: var(--r-pill);
+  background: var(--glass-bg-sunken); border: 1px solid var(--glass-border);
+}
+.flow-seg > button {
+  appearance: none; border: 1px solid transparent; background: transparent; cursor: pointer;
+  padding: 5px 14px; border-radius: var(--r-pill); color: var(--text-dim);
+  font-family: inherit; font-size: var(--fs-sm); font-weight: var(--fw-semi);
+  transition: background var(--dur-2) var(--ease-std), color var(--dur-2) var(--ease-std);
+}
+.flow-seg > button:hover { color: var(--text); background: var(--glass-bg-hover); }
+.flow-seg > button.on {
+  color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+  border-color: rgba(255,255,255,.14); box-shadow: 0 2px 10px rgba(var(--accent-rgb), .34);
+}
+.flow-btn {
+  appearance: none; cursor: pointer; font-family: inherit; font-size: var(--fs-sm); font-weight: var(--fw-semi);
+  padding: 7px 14px; border-radius: var(--r-sm); display: inline-flex; align-items: center; gap: 6px;
+  background: var(--glass-bg); border: 1px solid var(--glass-border); color: var(--text-dim);
+  transition: background var(--dur-2) var(--ease-std), border-color var(--dur-2) var(--ease-std), color var(--dur-2) var(--ease-std);
+}
+.flow-btn:hover:not(:disabled) { background: var(--glass-bg-hover); border-color: var(--glass-border-bright); color: var(--text); }
+.flow-btn:disabled { opacity: .45; cursor: not-allowed; }
+.flow-btn.primary { background: linear-gradient(135deg, var(--accent), var(--accent-hover)); color: #fff; border-color: rgba(255,255,255,.12); }
+.flow-btn.primary:hover:not(:disabled) { filter: brightness(1.06); color: #fff; }
+.flow-btn.warn { color: var(--medium); border-color: rgba(var(--warn-rgb), .34); }
+.flow-btn.danger { color: var(--high); border-color: rgba(var(--high-rgb), .32); }
+.flow-btn.danger:hover:not(:disabled) { background: rgba(var(--high-rgb), .10); color: var(--high); }
+.flow-hint { font-size: var(--fs-xs); color: var(--text-faint); line-height: var(--lh-snug); }
+.flow-chipstat {
+  font-size: var(--fs-2xs); font-weight: var(--fw-semi); letter-spacing: .02em;
+  padding: 3px 9px; border-radius: var(--r-pill); border: 1px solid var(--glass-border);
+  background: var(--glass-bg-sunken); color: var(--text-dim); white-space: nowrap;
+}
+.flow-chipstat.ok { color: var(--safe); border-color: rgba(var(--safe-rgb), .32); background: rgba(var(--safe-rgb), .10); }
+.flow-chipstat.err { color: var(--high); border-color: rgba(var(--high-rgb), .32); background: rgba(var(--high-rgb), .10); }
+.flow-chipstat.warn { color: var(--medium); border-color: rgba(var(--warn-rgb), .32); background: rgba(var(--warn-rgb), .10); }
+.flow-chipstat.dirty { color: var(--brass); border-color: rgba(var(--brass-rgb), .34); background: rgba(var(--brass-rgb), .10); }
+
+/* ── 画布 ── */
+.flow-canvas-scroll {
+  position: relative; overflow: auto; border-radius: var(--r-md);
+  border: 1px solid var(--glass-border); background: var(--glass-bg-sunken);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,.18);
+  max-height: 620px;
+}
+.flow-canvas {
+  position: relative; width: 880px; height: 700px;
+  background-color: transparent;
+  background-image:
+    linear-gradient(to right, rgba(var(--accent-rgb), .07) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(var(--accent-rgb), .07) 1px, transparent 1px),
+    linear-gradient(to right, rgba(var(--accent-rgb), .14) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(var(--accent-rgb), .14) 1px, transparent 1px);
+  background-size: 22px 22px, 22px 22px, 110px 110px, 110px 110px;
+  touch-action: none;
+}
+.flow-canvas.linking { cursor: crosshair; }
+.flow-edges {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  pointer-events: none; overflow: visible;
+}
+.flow-edge-line { fill: none; stroke: var(--text-faint); stroke-width: 2; pointer-events: none; }
+.flow-edge-hit { fill: none; stroke: transparent; stroke-width: 18; pointer-events: stroke; cursor: pointer; }
+.flow-edge-g.selected .flow-edge-line { stroke: var(--accent); stroke-width: 3.2; }
+.flow-edge-g.selected .flow-edge-hit { stroke: rgba(var(--accent-rgb), .12); }
+.flow-edge-g:hover .flow-edge-line { stroke: var(--accent-hover); }
+.flow-edge-g.bad .flow-edge-line { stroke: var(--high); stroke-dasharray: 5 4; }
+.flow-edge-prio { font-size: 10px; fill: var(--brass); font-family: var(--font-mono); pointer-events: none; }
+.flow-ghost { fill: none; stroke: var(--accent); stroke-width: 2.2; stroke-dasharray: 6 5; pointer-events: none; }
+
+/* ── 节点 ── */
+/* 节点层整体不吃事件，仅节点自身可命中，避免遮住下方 SVG 连线的 hit path */
+.flow-nodes { position: absolute; inset: 0; pointer-events: none; }
+.flow-node {
+  pointer-events: auto;
+  position: absolute; left: 0; top: 0; width: 168px; box-sizing: border-box;
+  display: flex; align-items: center; gap: var(--sp-2); padding: 9px 10px;
+  border-radius: var(--r-md); cursor: grab; user-select: none;
+  background: var(--glass-bg-solid); backdrop-filter: blur(var(--blur-2)) saturate(var(--glass-sat));
+  -webkit-backdrop-filter: blur(var(--blur-2)) saturate(var(--glass-sat));
+  border: 1px solid var(--glass-border-bright);
+  box-shadow: var(--sh-2), inset 0 1px 0 var(--glass-edge-hi);
+  will-change: transform;
+}
+.flow-node:hover { border-color: var(--accent); }
+.flow-node.dragging { cursor: grabbing; box-shadow: var(--sh-4); z-index: 40; }
+.flow-node.selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(var(--accent-rgb), .34), var(--sh-3); z-index: 30; }
+.flow-node.locked { cursor: default; }
+.flow-node.fixed {
+  background: linear-gradient(135deg, rgba(var(--accent-rgb), .16), rgba(var(--brass-rgb), .10)), var(--glass-bg-solid);
+  border-color: rgba(var(--accent-rgb), .42);
+}
+.flow-node.n-merge {
+  background: linear-gradient(135deg, rgba(var(--brass-rgb), .16), transparent), var(--glass-bg-solid);
+  border-color: rgba(var(--brass-rgb), .44);
+}
+.flow-node.f-dup { border-color: rgba(var(--brass-rgb), .45); }
+.flow-node.f-warn { border-color: rgba(var(--warn-rgb), .6); box-shadow: 0 0 0 2px rgba(var(--warn-rgb), .2), var(--sh-2); }
+.flow-node.f-err { border-color: var(--high); box-shadow: 0 0 0 2px rgba(var(--high-rgb), .32), var(--sh-2); }
+.flow-node.f-off { opacity: .52; filter: saturate(.35); }
+.fn-icon { font-size: 15px; line-height: 1; flex: 0 0 auto; width: 18px; text-align: center; }
+.fn-main { min-width: 0; flex: 1 1 auto; }
+.fn-title { font-size: var(--fs-sm); font-weight: var(--fw-semi); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fn-sub { font-size: var(--fs-2xs); color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--font-mono); }
+.fn-flag { position: absolute; top: -8px; right: -6px; font-size: var(--fs-2xs); padding: 1px 6px; border-radius: var(--r-pill); background: var(--brass); color: #241d16; font-weight: var(--fw-bold); }
+.fn-port {
+  position: absolute; left: 50%; width: 12px; height: 12px; margin-left: -6px;
+  border-radius: 50%; box-sizing: border-box; z-index: 5;
+  background: var(--glass-bg-solid); border: 2px solid var(--text-faint);
+  transition: border-color var(--dur-1) linear, background var(--dur-1) linear;
+}
+.fn-port::after { content: ''; position: absolute; inset: -7px; border-radius: 50%; }
+.fn-port.in { top: -7px; }
+.fn-port.out { bottom: -7px; cursor: crosshair; }
+.fn-port.hot { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 5px rgba(var(--accent-rgb), .2); }
+.fn-port.bad { border-color: var(--high); background: var(--high); box-shadow: 0 0 0 5px rgba(var(--high-rgb), .18); }
+
+/* ── 固定泳道（下限层 / 终裁层）── */
+.flow-lane {
+  border: 1px dashed var(--glass-border-bright); border-radius: var(--r-md);
+  background: var(--glass-bg-sunken); padding: var(--sp-2) var(--sp-3);
+  display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+}
+.flow-lane-label {
+  font-size: var(--fs-2xs); font-weight: var(--fw-bold); letter-spacing: var(--tracking-caps);
+  text-transform: uppercase; color: var(--text-faint); flex: 0 0 auto;
+}
+.flow-lane-items { display: flex; gap: 6px; flex-wrap: wrap; flex: 1 1 auto; }
+.flow-floor {
+  display: inline-flex; align-items: center; gap: 7px; padding: 4px 8px; border-radius: var(--r-pill);
+  background: var(--glass-bg); border: 1px solid var(--glass-border); font-size: var(--fs-xs); color: var(--text);
+}
+.flow-floor.off { opacity: .5; }
+.flow-floor button {
+  appearance: none; border: none; background: transparent; cursor: pointer; padding: 0 2px;
+  color: var(--text-faint); font-size: var(--fs-xs); line-height: 1; font-family: inherit;
+}
+.flow-floor button:hover { color: var(--accent); }
+.flow-floor button.rm:hover { color: var(--high); }
+
+/* ── 侧栏面板 ── */
+.flow-panel {
+  border: 1px solid var(--glass-border); border-radius: var(--r-md);
+  background: var(--glass-bg); backdrop-filter: blur(var(--blur-2)) saturate(var(--glass-sat));
+  -webkit-backdrop-filter: blur(var(--blur-2)) saturate(var(--glass-sat));
+  box-shadow: var(--sh-1); overflow: hidden;
+}
+.flow-panel-h {
+  display: flex; align-items: center; gap: var(--sp-2); padding: 9px 12px;
+  border-bottom: 1px solid var(--glass-border); background: var(--glass-bg-sunken);
+  font-size: var(--fs-xs); font-weight: var(--fw-bold); color: var(--text-dim);
+  letter-spacing: var(--tracking-caps); text-transform: uppercase;
+}
+.flow-panel-h .grow { flex: 1 1 auto; }
+.flow-panel-b { padding: var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-3); max-height: 560px; overflow: auto; }
+.flow-grp-title { font-size: var(--fs-2xs); font-weight: var(--fw-bold); color: var(--text-faint); letter-spacing: .05em; text-transform: uppercase; margin-bottom: -4px; }
+
+.flow-svc {
+  display: flex; gap: var(--sp-2); align-items: flex-start; padding: 9px 10px; border-radius: var(--r-sm);
+  border: 1px solid var(--glass-border); background: var(--glass-bg-sunken); cursor: grab;
+  transition: border-color var(--dur-2) var(--ease-std), background var(--dur-2) var(--ease-std);
+}
+.flow-svc:hover:not(.off) { border-color: var(--accent); background: var(--glass-bg-hover); }
+.flow-svc.off { cursor: not-allowed; opacity: .58; }
+.flow-svc.off:hover { border-color: rgba(var(--high-rgb), .4); }
+.flow-svc.used { border-style: dashed; }
+.flow-svc-t { font-size: var(--fs-sm); font-weight: var(--fw-semi); color: var(--text); }
+.flow-svc-d { font-size: var(--fs-2xs); color: var(--text-faint); line-height: var(--lh-snug); margin-top: 2px; }
+.flow-svc-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 5px; }
+.flow-tag { font-size: var(--fs-2xs); padding: 1px 6px; border-radius: var(--r-pill); border: 1px solid var(--glass-border); color: var(--text-faint); }
+.flow-tag.paid { color: var(--brass); border-color: rgba(var(--brass-rgb), .35); }
+.flow-tag.free { color: var(--safe); border-color: rgba(var(--safe-rgb), .3); }
+.flow-tag.img { color: var(--accent-2); border-color: rgba(var(--accent2-rgb), .32); }
+.flow-tag.txt { color: var(--accent); border-color: rgba(var(--accent-rgb), .3); }
+.flow-tag.no { color: var(--high); border-color: rgba(var(--high-rgb), .34); }
+
+/* 不可用服务的置灰块 + 原因 + 修复 */
+.flow-nr {
+  margin-top: 6px; padding: 6px 8px; border-radius: var(--r-xs);
+  background: rgba(var(--high-rgb), .08); border: 1px solid rgba(var(--high-rgb), .26);
+  display: flex; flex-direction: column; gap: 5px;
+}
+.flow-nr-msg { font-size: var(--fs-2xs); color: var(--text-dim); line-height: var(--lh-snug); }
+.flow-nr-msg b { color: var(--high); }
+.flow-nr-fix {
+  align-self: flex-start; appearance: none; cursor: pointer; font-family: inherit;
+  font-size: var(--fs-2xs); font-weight: var(--fw-semi); padding: 3px 9px; border-radius: var(--r-pill);
+  background: var(--glass-bg); border: 1px solid var(--glass-border-bright); color: var(--accent);
+}
+.flow-nr-fix:hover { background: var(--glass-bg-hover); }
+.flow-nr-code {
+  font-family: var(--font-mono); font-size: var(--fs-2xs); color: var(--text);
+  background: var(--glass-bg-sunken); border: 1px solid var(--glass-border); border-radius: var(--r-xs);
+  padding: 4px 6px; word-break: break-all; user-select: all;
+}
+
+/* ── 抽屉表单 ── */
+.flow-field { display: flex; flex-direction: column; gap: 5px; }
+.flow-field-l { font-size: var(--fs-xs); font-weight: var(--fw-semi); color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
+.flow-field-l .req { color: var(--high); }
+.flow-field-d { font-size: var(--fs-2xs); color: var(--text-faint); line-height: var(--lh-snug); }
+.flow-field input[type="text"], .flow-field input[type="number"], .flow-field select, .flow-field textarea {
+  width: 100%; box-sizing: border-box; padding: 7px 10px; font-size: var(--fs-sm); font-family: inherit;
+  color: var(--text); background: var(--glass-bg-sunken); border: 1px solid var(--glass-border);
+  border-radius: var(--r-sm); outline: none;
+}
+.flow-field textarea { min-height: 64px; resize: vertical; font-family: var(--font-mono); }
+.flow-field input:focus, .flow-field select:focus, .flow-field textarea:focus { border-color: var(--accent); }
+.flow-field input:disabled, .flow-field select:disabled, .flow-field textarea:disabled { opacity: .5; cursor: not-allowed; }
+.flow-checks { display: flex; flex-direction: column; gap: 4px; }
+.flow-check { display: flex; align-items: center; gap: 7px; font-size: var(--fs-xs); color: var(--text); cursor: pointer; }
+.flow-check input { accent-color: var(--accent); }
+.flow-srow { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); }
+.flow-prio-row { display: flex; align-items: center; gap: 8px; font-size: var(--fs-xs); }
+.flow-prio-row .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-prio-row input { width: 74px; padding: 4px 7px; font-size: var(--fs-xs); }
+
+/* ── level-map（服务建议 → 风险等级）── */
+.flow-lmap { display: flex; flex-direction: column; gap: 6px; }
+.flow-lmap-row { display: grid; grid-template-columns: 1fr 118px; gap: 8px; align-items: center; }
+.flow-lmap-k { font-size: var(--fs-xs); color: var(--text); display: flex; flex-direction: column; line-height: var(--lh-snug); }
+.flow-lmap-k em { font-style: normal; font-size: var(--fs-2xs); color: var(--text-faint); }
+.flow-lmap-row select {
+  width: 100%; box-sizing: border-box; padding: 5px 8px; font-size: var(--fs-sm); font-family: inherit;
+  color: var(--text); background: var(--glass-bg-sunken); border: 1px solid var(--glass-border);
+  border-radius: var(--r-sm); outline: none;
+}
+.flow-lmap-row select:focus { border-color: var(--accent); }
+.flow-lmap-row select:disabled { opacity: .5; cursor: not-allowed; }
+.flow-lmap-row.locked select { border-color: rgba(var(--warn-rgb), .55); background: rgba(var(--warn-rgb), .08); }
+
+/* ── 问题 / trace 列表 ── */
+.flow-issue {
+  display: flex; gap: 8px; align-items: flex-start; padding: 6px 8px; border-radius: var(--r-xs);
+  background: var(--glass-bg-sunken); border: 1px solid var(--glass-border); font-size: var(--fs-xs);
+  cursor: default;
+}
+.flow-issue.clickable { cursor: pointer; }
+.flow-issue.clickable:hover { border-color: var(--accent); }
+.flow-issue.e { border-color: rgba(var(--high-rgb), .36); background: rgba(var(--high-rgb), .07); }
+.flow-issue.w { border-color: rgba(var(--warn-rgb), .32); background: rgba(var(--warn-rgb), .06); }
+.flow-issue-code { font-family: var(--font-mono); font-size: var(--fs-2xs); font-weight: var(--fw-bold); flex: 0 0 auto; padding-top: 1px; }
+.flow-issue.e .flow-issue-code { color: var(--high); }
+.flow-issue.w .flow-issue-code { color: var(--medium); }
+.flow-issue-body { flex: 1 1 auto; min-width: 0; color: var(--text-dim); line-height: var(--lh-snug); word-break: break-word; }
+.flow-issue-path { font-family: var(--font-mono); font-size: var(--fs-2xs); color: var(--text-faint); }
+.flow-trace-row {
+  display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 7px 9px;
+  border-radius: var(--r-xs); background: var(--glass-bg-sunken); border: 1px solid var(--glass-border);
+  border-left: 3px solid var(--verdict-skip);
+}
+.flow-trace-row.ok { border-left-color: var(--safe); }
+.flow-trace-row.failed { border-left-color: var(--high); }
+.flow-trace-row.skipped { border-left-color: var(--verdict-skip); }
+.flow-trace-t { font-size: var(--fs-xs); font-weight: var(--fw-semi); color: var(--text); }
+.flow-trace-m { font-size: var(--fs-2xs); color: var(--text-faint); font-family: var(--font-mono); grid-column: 1 / -1; }
+.flow-trace-v { font-size: var(--fs-2xs); color: var(--text-dim); text-align: right; white-space: nowrap; }
+.flow-kv { display: flex; gap: 8px; justify-content: space-between; font-size: var(--fs-xs); padding: 3px 0; border-bottom: 1px dashed var(--glass-border); }
+.flow-kv:last-child { border-bottom: none; }
+.flow-kv b { font-weight: var(--fw-semi); color: var(--text); }
+
+/* ── 拖拽幽灵 ── */
+.flow-dragghost {
+  position: fixed; z-index: 9999; pointer-events: none; opacity: .9;
+  padding: 7px 12px; border-radius: var(--r-sm); font-size: var(--fs-sm); font-weight: var(--fw-semi);
+  background: var(--glass-bg-solid); border: 1px solid var(--accent); color: var(--text);
+  box-shadow: var(--sh-3); backdrop-filter: blur(var(--blur-2));
+}
+
+.flow-legend { display: flex; gap: var(--sp-3); flex-wrap: wrap; font-size: var(--fs-2xs); color: var(--text-faint); }
+.flow-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
+
+/* 窄屏：改为纵向堆叠。注意必须把 align-items 改回 stretch，
+   否则（flex-start 下）子项按 fit-content 收缩，画布定宽会把整页撑破。 */
+@media (max-width: 1040px) {
+  .flow-workspace { flex-direction: column; align-items: stretch; }
+  .flow-main, .flow-aside { flex: 1 1 auto; width: 100%; min-width: 0; max-width: 100%; }
+  .flow-canvas-scroll { max-width: 100%; }
+  .flow-panel-b { max-height: none; }
+  .flow-lane-items { min-width: 0; }
+}
 </style>
 <script>
 /* 主题 / 特效开关：必须在首屏渲染前落地，避免闪色 */
@@ -2097,6 +2391,7 @@ h1, h2, h3, h4 { line-height: var(--lh-tight); }
     <div class="tab" data-tab="chat">对话</div>
     <div class="tab" data-tab="compare">模型对比</div>
     <div class="tab" data-tab="config">审核配置</div>
+    <div class="tab" data-tab="flow">审核流程</div>
     <div class="tab" data-tab="docs">API文档</div>
     <div class="tab" data-tab="worddb">词库管理</div>
     <div class="tab" data-tab="stats">统计面板</div>
@@ -2501,6 +2796,86 @@ h1, h2, h3, h4 { line-height: var(--lh-tight); }
       </div>
     </div>
     <div class="plugin-view-slot" data-category="config"></div>
+  </div>
+
+  <!-- 审核流程 Tab（DAG 可视化编排画布） -->
+  <div id="tab-flow" class="tab-content" style="display:none">
+    <div class="card" style="padding:16px 18px">
+      <div class="flow-toolbar">
+        <div class="flow-seg" id="flowModSeg">
+          <button type="button" data-mod="text" class="on">文本流程</button>
+          <button type="button" data-mod="image">图像流程</button>
+        </div>
+        <span id="flowChips" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"></span>
+        <span class="grow"></span>
+        <button class="flow-btn primary" id="flowBtnSave" type="button">保存</button>
+        <button class="flow-btn" id="flowBtnValidate" type="button">校验</button>
+        <button class="flow-btn" id="flowBtnDry" type="button">试运行</button>
+        <button class="flow-btn" id="flowBtnCopy" type="button">复制到图像</button>
+        <button class="flow-btn" id="flowBtnLayout" type="button">自动排版</button>
+        <button class="flow-btn" id="flowBtnUndo" type="button">撤销</button>
+        <button class="flow-btn danger" id="flowBtnReset" type="button">重置默认拓扑</button>
+      </div>
+      <div class="flow-hint" style="margin-top:9px">
+        从右侧「服务面板」拖入节点；从节点<b>底部圆点</b>按住拖到目标节点<b>顶部圆点</b>即可连线。单击节点打开参数抽屉，单击连线后按
+        <b>Delete</b> 删除连线，<b>Ctrl+Z</b> 撤销。一个节点连出多条边即表示<b>并行分支</b>；多条分支回到同一点前需先接入<b>汇聚</b>节点。
+      </div>
+    </div>
+
+    <div class="flow-workspace">
+      <div class="flow-main">
+        <div class="flow-lane" id="flowLaneFloors"></div>
+        <div class="flow-canvas-scroll" id="flowScroll">
+          <div class="flow-canvas" id="flowCanvas">
+            <svg class="flow-edges" id="flowSvg" width="880" height="700" viewBox="0 0 880 700" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <g id="flowEdgeG"></g>
+              <g id="flowGhostG"></g>
+            </svg>
+            <div class="flow-nodes" id="flowNodes"></div>
+          </div>
+        </div>
+        <div class="flow-lane" id="flowLaneFinalizers"></div>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px">
+          <div class="flow-panel">
+            <div class="flow-panel-h"><span class="grow">校验结果（服务端权威）</span><span id="flowIssueCount" class="flow-chipstat">—</span></div>
+            <div class="flow-panel-b" id="flowIssues" style="max-height:320px"></div>
+          </div>
+          <div class="flow-panel">
+            <div class="flow-panel-h"><span class="grow">试运行（逐节点 trace）</span><button class="flow-btn" id="flowBtnRunDry" type="button" style="padding:3px 10px;font-size:var(--fs-2xs)">运行</button></div>
+            <div class="flow-panel-b" style="max-height:320px">
+              <div class="flow-field" id="flowDryTextWrap">
+                <label class="flow-field-l">样例文本</label>
+                <textarea id="flowDryText">这是一段用于试运行的示例文本。</textarea>
+              </div>
+              <div class="flow-field" id="flowDryImageWrap" style="display:none">
+                <label class="flow-field-l">样例图片</label>
+                <input type="file" id="flowDryFile" accept="image/*" style="font-size:var(--fs-xs);color:var(--text-dim)">
+                <label class="flow-field-l">附带文本</label>
+                <input type="text" id="flowDryCaption" placeholder="可留空">
+              </div>
+              <div class="flow-hint" id="flowDryNote"></div>
+              <div id="flowDryOut"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="flow-aside">
+        <div class="flow-panel">
+          <div class="flow-panel-h"><span class="grow">服务面板</span><button class="flow-btn" id="flowBtnReloadCaps" type="button" style="padding:3px 9px;font-size:var(--fs-2xs)">刷新</button></div>
+          <div class="flow-panel-b" id="flowPalette"></div>
+        </div>
+        <div class="flow-panel" id="flowDrawerPanel" style="display:none">
+          <div class="flow-panel-h"><button class="flow-btn" id="flowBtnDrawerBack" type="button" style="padding:2px 8px;font-size:var(--fs-2xs)">← 面板</button><span class="grow" id="flowDrawerTitle">节点参数</span><button class="flow-btn danger" id="flowBtnNodeDel" type="button" style="padding:2px 8px;font-size:var(--fs-2xs)">删除</button></div>
+          <div class="flow-panel-b" id="flowDrawer"></div>
+        </div>
+        <div class="flow-panel">
+          <div class="flow-panel-h">派生视图（与旧接口同步）</div>
+          <div class="flow-panel-b" id="flowDerived" style="max-height:240px"></div>
+        </div>
+      </aside>
+    </div>
   </div>
 
   <!-- API Docs Tab -->
@@ -8223,6 +8598,1587 @@ function showToast(msg) {
     document.body.appendChild(inp);
   }
   renderPluginViews();
+})();
+</script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   审核流程画布（Flow DAG Canvas）· 前端实现
+   架构依据：GRS v2.2.0 §15
+     · 背景网格 = CSS linear-gradient；连线层 = 单个绝对定位 <svg>（pointer-events:none，
+       仅 <path> 设 pointer-events:stroke）；节点 = 绝对定位 <div> + transform:translate
+     · 画布懒初始化；拖拽只改 transform 不触发 layout；连线 path 在 rAF 中批量更新；
+       容器上做 pointerdown/move/up 事件委托；状态 = 单一 F 对象 + 全量重绘；撤销栈 ≤10
+   数据边界（§15.4）：前端只负责布局/交互/即时提示，把 JSON 原样提交；
+     服务端 /api/flow/validate 为最终权威，前端不自行修正非法图（不自动删边/补节点）。
+   ═══════════════════════════════════════════════════════════════════ */
+(function () {
+  'use strict';
+
+  const CW = 880, CH = 700, NW = 168, NH = 58, SNAP = 11;
+
+  /** 就绪度原因 → 兜底文案（描述符自带 notReadyMessage 时优先用自带的）。 */
+  const NR_FALLBACK = {
+    'missing-deps': '该服务所需的可选依赖未安装，因此处于不可用状态。',
+    'not-configured': '该服务尚未完成配置（缺少服务地址或凭据），因此处于不可用状态。',
+    'service-unreachable': '无法连接到该服务，请确认服务已启动且地址填写正确。',
+    'worddb-empty': '该服务依赖的词库为空，判定结果不可靠。',
+    'probe-failed': '就绪度探测过程中发生异常，请检查该服务的配置。',
+    'not-registered': '该节点未在服务端注册表中，可能对应插件已卸载。',
+  };
+  /** 未就绪原因 → 修复落点（跳转的 Tab）。 */
+  const NR_GOTO = { 'worddb-empty': 'worddb' };
+  const STRATEGY_LABEL = { highest: '取最严重', lowest: '取最轻', priority: '以指定分支为准' };
+  /** 风险等级枚举（与 src/flow/risk.js 的 RISK_ORDER 同序，仅用于 levelMap 下拉）。 */
+  const LEVELS = ['safe', 'low', 'medium', 'review', 'high', 'critical'];
+  /** levelMap 的「服务建议」键 → 中文说明（未知键原样展示）。 */
+  const SUGGESTION_LABEL = { block: '建议拦截', review: '建议复审', pass: '建议通过' };
+  /** levelMap.block 的兜底允许值（架构不变量：block 只能映射到 high/critical）。
+   *  描述符若下发 levelMapBlockLevels 则以描述符为准（单一真相源优先）。 */
+  const DEFAULT_BLOCK_LEVELS = ['high', 'critical'];
+  const POLICY_LABEL = { inherit: '继承全局（inherit）', block: '直接拦截（block）', review: '转人工（review）', skip: '跳过（skip · 高危）' };
+  const ROLE_LABEL = { service: '判定服务', contribute: '透传 / 特征', finalize: '终裁', floor: '下限层' };
+
+  const F = {
+    inited: false,
+    caps: { nodes: [], finalizers: [], hostApiVersion: '' },
+    capsById: {},
+    modality: 'text',
+    drafts: { text: null, image: null },
+    selNode: null, selEdge: null,
+    errors: [], warnings: [],
+    undo: [], drag: null, rafId: 0, vtimer: 0,
+    dryImageB64: '', dryRunning: false, dryResult: null,
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const cur = () => (F.drafts[F.modality] ? F.drafts[F.modality].flow : null);
+  const curDraft = () => F.drafts[F.modality];
+
+  /* ───────────────────────── 数据访问 ───────────────────────── */
+
+  function normFlow(flow) {
+    const f = flow && typeof flow === 'object' ? flow : {};
+    return {
+      schemaVersion: f.schemaVersion === undefined ? 1 : f.schemaVersion,
+      modality: f.modality,
+      revision: f.revision,
+      updatedAt: f.updatedAt,
+      floors: Array.isArray(f.floors) ? f.floors : [],
+      nodes: (Array.isArray(f.nodes) ? f.nodes : []).map((n) => ({
+        ...n,
+        position: n && n.position && Number.isFinite(n.position.x) && Number.isFinite(n.position.y)
+          ? { x: n.position.x, y: n.position.y } : null,
+      })),
+      edges: Array.isArray(f.edges) ? f.edges : [],
+      finalizers: Array.isArray(f.finalizers) ? f.finalizers : [],
+      meta: f.meta || { note: '', sourceOfTruth: true },
+    };
+  }
+
+  async function reloadCaps() {
+    const r = await fetch(`${API}/api/flow/capabilities`);
+    if (!r.ok) throw new Error(`capabilities HTTP ${r.status}`);
+    const data = await r.json();
+    F.caps = {
+      nodes: Array.isArray(data.nodes) ? data.nodes : [],
+      finalizers: Array.isArray(data.finalizers) ? data.finalizers : [],
+      hostApiVersion: data.hostApiVersion || '',
+    };
+    F.capsById = {};
+    F.caps.nodes.forEach((n) => { F.capsById[n.ref] = n; });
+  }
+
+  async function loadFlow(mod) {
+    const r = await fetch(`${API}/api/flow/${mod}`);
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.flow) { F.drafts[mod] = null; return data; }
+    const flow = normFlow(data.flow);
+    if (needsLayout(flow)) autoLayout(flow);
+    F.drafts[mod] = { flow, revision: Number(flow.revision) || 0, dirty: false };
+    if (mod === F.modality) {
+      F.errors = Array.isArray(data.errors) ? data.errors : [];
+      F.warnings = Array.isArray(data.warnings) ? data.warnings : [];
+      F.undo = [];
+    }
+    return data;
+  }
+
+  /** 位置缺失或越界 → 需要自动排版（仅布局，不改语义）。 */
+  function needsLayout(flow) {
+    if (!flow.nodes.length) return false;
+    return flow.nodes.some((n) => !n.position
+      || n.position.x < -NW / 2 || n.position.x > CW - NW / 2
+      || n.position.y < -8 || n.position.y > CH - NH - 6);
+  }
+
+  /** 按 BFS 层级自动排版（前端只负责布局，语义仍由服务端校验）。 */
+  function autoLayout(flow) {
+    const nodes = flow.nodes;
+    const byId = {};
+    nodes.forEach((n) => { byId[n.id] = n; });
+    const adj = {};
+    nodes.forEach((n) => { adj[n.id] = []; });
+    flow.edges.forEach((e) => { if (adj[e.from] && byId[e.to]) adj[e.from].push(e.to); });
+    const lv = {};
+    const input = nodes.find((n) => n.type === 'input');
+    if (input) {
+      const q = [input.id];
+      lv[input.id] = 0;
+      const seen = new Set();
+      while (q.length) {
+        const id = q.shift();
+        if (seen.has(id)) continue;
+        seen.add(id);
+        for (const nx of adj[id] || []) {
+          lv[nx] = Math.max(lv[nx] === undefined ? 0 : lv[nx], (lv[id] || 0) + 1);
+          q.push(nx);
+        }
+      }
+    }
+    let maxLv = 0;
+    Object.keys(lv).forEach((k) => { if (lv[k] > maxLv) maxLv = lv[k]; });
+    const groups = {};
+    nodes.forEach((n) => {
+      const level = lv[n.id] === undefined ? maxLv + 1 : lv[n.id];
+      (groups[level] = groups[level] || []).push(n);
+    });
+    const COL = 196, ROW = 116;
+    Object.keys(groups).map(Number).sort((a, b) => a - b).forEach((level) => {
+      const list = groups[level];
+      list.forEach((n, i) => {
+        const x = Math.round(CW / 2 + (i - (list.length - 1) / 2) * COL - NW / 2);
+        n.position = {
+          x: Math.max(18, Math.min(CW - NW - 18, x)),
+          y: Math.min(CH - NH - 14, 40 + level * ROW),
+        };
+      });
+    });
+  }
+
+  /* ───────────────────────── 渲染 ───────────────────────── */
+
+  function render(opts) {
+    if (!F.inited) return;
+    const o = opts || {};
+    renderChips();
+    renderLanes();
+    renderCanvas();
+    if (!o.canvasOnly) {
+      renderPalette();
+      renderDrawer();
+      renderDerivedShell();
+    }
+    renderIssues();
+  }
+
+  function markDirty() {
+    const d = curDraft();
+    if (d) d.dirty = true;
+    renderChips();
+  }
+
+  function nodeTitle(n) {
+    if (n.type === 'input') return '输入 · 原始内容';
+    if (n.type === 'output') return '输出 · 最终判定';
+    if (n.type === 'merge') return '汇聚 · ' + (STRATEGY_LABEL[n.strategy] || n.strategy || '未设置');
+    const d = F.capsById[n.ref];
+    return d ? d.title : (n.ref || '未注册节点');
+  }
+  function nodeIcon(n) {
+    if (n.type === 'input') return '▤';
+    if (n.type === 'output') return '◉';
+    if (n.type === 'merge') return '⋈';
+    const d = F.capsById[n.ref];
+    if (d && d.icon) return d.icon;
+    return d && d.role === 'contribute' ? '⇢' : '●';
+  }
+  function nodeSub(n) {
+    if (n.type === 'input') return 'input';
+    if (n.type === 'output') return 'output';
+    if (n.type === 'merge') return 'merge · ' + (n.strategy || '—');
+    return n.ref || '—';
+  }
+
+  function renderChips() {
+    const box = $('flowChips');
+    if (!box) return;
+    const d = curDraft();
+    if (!d) { box.innerHTML = '<span class="flow-chipstat">未加载</span>'; return; }
+    const flow = d.flow;
+    const paid = countPaid(flow);
+    const parts = [
+      `<span class="flow-chipstat">${F.modality === 'text' ? '文本' : '图像'} · revision ${d.revision}</span>`,
+      F.errors.length
+        ? `<span class="flow-chipstat err">${F.errors.length} 个错误</span>`
+        : '<span class="flow-chipstat ok">校验通过</span>',
+      F.warnings.length ? `<span class="flow-chipstat warn">${F.warnings.length} 个警告</span>` : '',
+      d.dirty ? '<span class="flow-chipstat dirty">有未保存改动</span>' : '',
+      paid ? `<span class="flow-chipstat warn">本次将产生 ${paid} 次付费调用</span>` : '',
+      `<span class="flow-chipstat">节点 ${flow.nodes.length} · 连线 ${flow.edges.length}</span>`,
+    ];
+    box.innerHTML = parts.filter(Boolean).join('');
+  }
+
+  function countPaid(flow) {
+    let n = 0;
+    flow.nodes.forEach((x) => {
+      if (x.type !== 'service' && x.type !== 'contribute') return;
+      const d = F.capsById[x.ref];
+      if (d && d.costHint === 'paid-api') n += 1;
+    });
+    flow.floors.filter((f) => f.enabled !== false).forEach((f) => {
+      const d = F.capsById[f.ref];
+      if (d && d.costHint === 'paid-api') n += 1;
+    });
+    return n;
+  }
+
+  function edgeIndex(flow) {
+    const pos = {};
+    flow.nodes.forEach((n) => { if (n.position) pos[n.id] = n.position; });
+    return pos;
+  }
+
+  function bez(x1, y1, x2, y2) {
+    const h = Math.max(26, Math.abs(y2 - y1) / 2.2);
+    return `M ${x1} ${y1} C ${x1} ${y1 + h}, ${x2} ${y2 - h}, ${x2} ${y2}`;
+  }
+
+  function renderCanvas() {
+    const wrap = $('flowNodes');
+    const gg = $('flowEdgeG');
+    if (!wrap || !gg) return;
+    const d = curDraft();
+    if (!d) {
+      wrap.innerHTML = '<div class="empty-state" style="position:absolute;inset:0;justify-content:center">流程尚未生成</div>';
+      gg.innerHTML = '';
+      return;
+    }
+    const flow = d.flow;
+    const eNodes = new Set(), wNodes = new Set(), bEdges = new Set();
+    F.errors.forEach((it) => {
+      const p = String(it && it.path || '');
+      let m = /^nodes\.([a-z][a-z0-9_]*)/.exec(p); if (m) eNodes.add(m[1]);
+      m = /^edges\.([A-Za-z0-9_]+)/.exec(p); if (m) bEdges.add(m[1]);
+    });
+    F.warnings.forEach((it) => {
+      const m = /^nodes\.([a-z][a-z0-9_]*)/.exec(String(it && it.path || ''));
+      if (m) wNodes.add(m[1]);
+    });
+
+    const pos = edgeIndex(flow);
+    const html = flow.nodes.map((n) => {
+      const desc = n.ref ? F.capsById[n.ref] : null;
+      const cls = ['flow-node'];
+      if (n.type === 'input' || n.type === 'output') cls.push('fixed', 'locked');
+      if (n.type === 'merge') cls.push('n-merge');
+      if (eNodes.has(n.id)) cls.push('f-err');
+      else if (wNodes.has(n.id)) cls.push('f-warn');
+      if (desc && desc.ready === false) cls.push('f-off');
+      if (F.selNode === n.id) cls.push('selected');
+      const p = n.position || { x: 0, y: 0 };
+      const flag = desc && desc.ready === false ? '<span class="fn-flag">不可用</span>' : '';
+      const pin = n.type === 'input' ? '' : `<div class="fn-port in" data-node="${esc(n.id)}" data-port="in" title="输入锚点"></div>`;
+      const pout = n.type === 'output' ? '' : `<div class="fn-port out" data-node="${esc(n.id)}" data-port="out" title="按住拖拽以连线"></div>`;
+      return `<div class="${cls.join(' ')}" data-node="${esc(n.id)}" style="transform:translate(${p.x}px,${p.y}px)">`
+        + pin
+        + `<span class="fn-icon">${esc(nodeIcon(n))}</span>`
+        + `<div class="fn-main"><div class="fn-title">${esc(nodeTitle(n))}</div><div class="fn-sub">${esc(nodeSub(n))}</div></div>`
+        + flag + pout + '</div>';
+    }).join('');
+    wrap.innerHTML = html;
+
+    const parts = [];
+    flow.edges.forEach((e) => {
+      const a = pos[e.from], b = pos[e.to];
+      if (!a || !b) return;
+      const x1 = a.x + NW / 2, y1 = a.y + NH, x2 = b.x + NW / 2, y2 = b.y;
+      const dd = bez(x1, y1, x2, y2);
+      const sel = F.selEdge === e.id ? ' selected' : '';
+      const bad = bEdges.has(e.id) ? ' bad' : '';
+      const pv = Number(e.priority);
+      const prio = Number.isFinite(pv) && pv !== 0
+        ? `<text class="flow-edge-prio" x="${(x1 + x2) / 2 + 7}" y="${(y1 + y2) / 2 + 3}">${esc(pv)}</text>` : '';
+      parts.push(`<g class="flow-edge-g${sel}${bad}" data-edge="${esc(e.id)}">`
+        + `<path class="flow-edge-hit" d="${dd}"></path>`
+        + `<path class="flow-edge-line" d="${dd}"></path>`
+        + prio + '</g>');
+    });
+    gg.innerHTML = parts.join('');
+    $('flowGhostG').innerHTML = '';
+  }
+
+  /** 仅重算连线（拖拽时在 rAF 中批量更新，避免全量重绘）。 */
+  function renderEdgePathsOnly() {
+    const d = curDraft();
+    if (!d) return;
+    const flow = d.flow;
+    const pos = edgeIndex(flow);
+    flow.edges.forEach((e) => {
+      const a = pos[e.from], b = pos[e.to];
+      if (!a || !b) return;
+      const g = document.querySelector(`.flow-edge-g[data-edge="${e.id}"]`);
+      if (!g) return;
+      const dd = bez(a.x + NW / 2, a.y + NH, b.x + NW / 2, b.y);
+      const paths = g.querySelectorAll('path');
+      paths.forEach((p) => p.setAttribute('d', dd));
+    });
+  }
+
+  function renderLanes() {
+    const d = curDraft();
+    const fl = $('flowLaneFloors');
+    const fi = $('flowLaneFinalizers');
+    if (!fl || !fi) return;
+    if (!d) { fl.innerHTML = ''; fi.innerHTML = ''; return; }
+    const flow = d.flow;
+
+    fl.innerHTML = '<span class="flow-lane-label">下限层 · 并行最先执行 · 只升不降</span><div class="flow-lane-items">'
+      + (flow.floors.length ? flow.floors.map((f, i) => {
+        const desc = F.capsById[f.ref];
+        const off = f.enabled === false;
+        return `<span class="flow-floor${off ? ' off' : ''}" title="${esc(f.ref)}">`
+          + `<span>${esc((desc && desc.title) || f.ref)}</span>`
+          + `<button type="button" data-lane="floor" data-act="toggle" data-i="${i}">${off ? '启用' : '停用'}</button>`
+          + '<button type="button" data-lane="floor" data-act="tomain" data-i="' + i + '" title="移入主管线（作为普通并行分支参与合并）">→主管线</button>'
+          + '<button type="button" class="rm" data-lane="floor" data-act="rm" data-i="' + i + '" title="删除">✕</button>'
+          + '</span>';
+      }).join('') : '<span class="flow-hint">（空）敏感词预检等兜底服务放在这里</span>')
+      + '</div>';
+
+    const avail = (F.caps.finalizers || []).filter((f) => (f.modality || []).includes(F.modality));
+    fi.innerHTML = '<span class="flow-lane-label">终裁层 · 主管线结论之后 · 可升可降</span><div class="flow-lane-items">'
+      + (flow.finalizers.length ? flow.finalizers.map((f, i) => {
+        const desc = (F.caps.finalizers || []).find((x) => x.ref === f.ref);
+        const off = f.enabled === false;
+        return `<span class="flow-floor${off ? ' off' : ''}" title="${esc(f.ref)}">`
+          + `<span>${esc(f.title || (desc && desc.title) || f.ref)}</span>`
+          + `<button type="button" data-lane="fin" data-act="toggle" data-i="${i}">${off ? '启用' : '停用'}</button>`
+          + '<button type="button" class="rm" data-lane="fin" data-act="rm" data-i="' + i + '" title="删除">✕</button>'
+          + '</span>';
+      }).join('') : '<span class="flow-hint">（空）</span>')
+      + avail.filter((a) => !flow.finalizers.some((f) => f.ref === a.ref))
+        .map((a) => `<button type="button" class="flow-floor" data-lane="fin" data-act="add" data-ref="${esc(a.ref)}">＋ ${esc(a.title || a.ref)}</button>`).join('')
+      + '</div>';
+  }
+
+  function renderPalette() {
+    const box = $('flowPalette');
+    if (!box) return;
+    const list = (F.caps.nodes || []).filter((n) => (n.modality || []).includes(F.modality)
+      && (n.role === 'service' || n.role === 'contribute'));
+    if (!list.length) { box.innerHTML = '<div class="empty-state">该模态下没有可用服务</div>'; return; }
+    const groups = { service: [], contribute: [] };
+    list.forEach((n) => { (groups[n.role === 'contribute' ? 'contribute' : 'service']).push(n); });
+    const flow = cur();
+    let html = '';
+    Object.keys(groups).forEach((role) => {
+      if (!groups[role].length) return;
+      html += `<div class="flow-grp-title">${ROLE_LABEL[role]}</div>`;
+      html += groups[role].map((n) => svcCard(n, flow)).join('');
+    });
+    html += '<div class="flow-grp-title">结构节点</div>';
+    html += '<div class="flow-svc" data-structural="merge" data-title="汇聚节点">'
+      + '<span class="fn-icon">⋈</span><div class="fn-main"><div class="flow-svc-t">汇聚节点</div>'
+      + '<div class="flow-svc-d">≥2 条入边合为 1 条；策略：取最严重 / 取最轻 / 以指定分支为准</div>'
+      + '<div class="flow-svc-tags"><span class="flow-tag">merge</span></div></div></div>';
+    box.innerHTML = html;
+  }
+
+  function svcCard(n, flow) {
+    const off = n.ready === false;
+    const used = flow ? flow.nodes.filter((x) => x.ref === n.ref).length : 0;
+    const inFloor = flow ? flow.floors.some((f) => f.ref === n.ref) : false;
+    const cost = n.costHint === 'paid-api' ? '<span class="flow-tag paid">付费</span>'
+      : n.costHint === 'local-compute' ? '<span class="flow-tag">本地算力</span>'
+        : '<span class="flow-tag free">免费</span>';
+    const mods = (n.modality || []).map((m) => `<span class="flow-tag ${m === 'image' ? 'img' : 'txt'}">${esc(m)}</span>`).join('');
+    const usedTag = used ? `<span class="flow-tag">已用 ×${used}</span>` : '';
+    const floorTag = inFloor ? '<span class="flow-tag">已在下限层</span>' : '';
+    return `<div class="flow-svc${off ? ' off' : ''}${used ? ' used' : ''}" data-ref="${esc(n.ref)}" data-title="${esc(n.title)}" title="${esc(off ? '不可用：' + notReadyText(n) : n.desc || n.ref)}">`
+      + `<span class="fn-icon">${esc(n.icon || '●')}</span><div class="fn-main">`
+      + `<div class="flow-svc-t">${esc(n.title)}${off ? ' · 不可用' : ''}</div>`
+      + `<div class="flow-svc-d">${esc(n.desc || n.ref)}</div>`
+      + `<div class="flow-svc-tags">${mods}${cost}${usedTag}${floorTag}</div>`
+      + (off ? `<div class="flow-nr">${notReadyHtml(n)}</div>` : '')
+      + '</div></div>';
+  }
+
+  function notReadyText(n) {
+    const reason = n.notReadyReason || '';
+    const label = (NR_FALLBACK[reason] || '').replace(/^该服务/, '');
+    return (n.notReadyMessage || label || reason || '未就绪');
+  }
+
+  function notReadyHtml(n) {
+    const reason = n.notReadyReason || '';
+    const fallback = NR_FALLBACK[reason] || '该服务当前处于不可用状态。';
+    const msg = n.notReadyMessage || fallback;
+    const fix = fixActionFor(n);
+    let html = `<div class="flow-nr-msg"><b>不可用（${esc(reason || 'unknown')}）</b>：${esc(msg)}</div>`;
+    if (n.installHint) html += `<div class="flow-nr-code">${esc(n.installHint)}</div>`;
+    if (n.configHint) html += `<div class="flow-nr-msg">${esc(n.configHint)}</div>`;
+    if (fix) html += `<button type="button" class="flow-nr-fix" data-fix="${esc(fix.type)}" data-ref="${esc(n.ref)}" data-payload="${esc(fix.payload || '')}">${esc(fix.label)}</button>`;
+    return html + '</div>';
+  }
+
+  /** 修复方式：描述符自带 fixAction/installHint 优先，否则按原因与 ref 兜底。 */
+  function fixActionFor(n) {
+    if (n.fixAction && typeof n.fixAction === 'object' && n.fixAction.type) {
+      const t = n.fixAction.type === 'copy-command' ? 'copy' : n.fixAction.type;
+      const raw = n.fixAction.payload;
+      const payload = typeof raw === 'string' && raw ? raw : (n.installHint || '');
+      return { type: t, label: t === 'copy' ? '复制安装命令' : '前往配置', payload };
+    }
+    if (n.installHint) return { type: 'copy', label: '复制安装命令', payload: n.installHint };
+    if (String(n.ref).indexOf('builtin.localModel') === 0) {
+      return { type: 'goto', label: '前往「本地模型」', payload: 'models', hint: n.configHint };
+    }
+    if (n.notReadyReason === 'worddb-empty') return { type: 'goto', label: '前往「词库管理」', payload: 'worddb' };
+    if (n.configHint) return { type: 'goto', label: '前往「审核配置」', payload: 'config', hint: n.configHint };
+    return { type: 'goto', label: '前往「审核配置」', payload: 'config' };
+  }
+
+  function renderIssues() {
+    const box = $('flowIssues');
+    const cnt = $('flowIssueCount');
+    if (!box) return;
+    const total = F.errors.length + F.warnings.length;
+    if (cnt) {
+      cnt.className = 'flow-chipstat ' + (F.errors.length ? 'err' : (F.warnings.length ? 'warn' : 'ok'));
+      cnt.textContent = F.errors.length ? `${F.errors.length} 错误 / ${F.warnings.length} 警告` : (total ? `${total} 警告` : '通过');
+    }
+    if (!total) {
+      box.innerHTML = '<div class="flow-hint">当前画布未发现校验问题。保存前服务端会再校验一次，非法图将整体拒绝保存（配置零写入）。</div>';
+      return;
+    }
+    const row = (it, level) => {
+      const path = String(it.path || '');
+      const target = /^nodes\./.test(path) || /^edges\./.test(path) ? '1' : '0';
+      return `<div class="flow-issue ${level}${target === '1' ? ' clickable' : ''}" data-goto="${esc(target === '1' ? path : '')}">`
+        + `<span class="flow-issue-code">${esc(it.code || (level === 'e' ? 'ERROR' : 'WARN'))}</span>`
+        + `<span class="flow-issue-body">${esc(it.message || '')}`
+        + (path ? `<div class="flow-issue-path">${esc(path)}</div>` : '') + '</span></div>';
+    };
+    box.innerHTML = F.errors.map((it) => row(it, 'e')).join('') + F.warnings.map((it) => row(it, 'w')).join('');
+  }
+
+  function renderDerivedShell() {
+    const box = $('flowDerived');
+    if (!box) return;
+    if (box.dataset.loaded === '1') return;
+    box.innerHTML = '<div class="flow-hint">加载中…</div>';
+  }
+
+  async function loadDerived() {
+    const box = $('flowDerived');
+    if (!box) return;
+    try {
+      const [rcRes, dmRes] = await Promise.all([
+        fetch(`${API}/api/review-channels`).catch(() => null),
+        fetch(`${API}/api/dual-mode`).catch(() => null),
+      ]);
+      const rc = rcRes && rcRes.ok ? await rcRes.json().catch(() => null) : null;
+      const dm = dmRes && dmRes.ok ? await dmRes.json().catch(() => null) : null;
+      let html = '';
+      if (rc) {
+        html += `<div class="flow-grp-title">GET /api/review-channels（由拓扑反算）</div>`;
+        html += kv('本地通道 local', rc.local ? '开' : '关');
+        html += kv('云端通道 cloud', rc.cloud ? '开' : '关');
+        html += kv('内容安全 contentSafety', rc.contentSafety ? '开' : '关');
+        html += kv('分歧策略 disputeStrategy', rc.disputeStrategy || '—');
+        if (rc.flows) {
+          ['text', 'image'].forEach((m) => {
+            const f = rc.flows[m];
+            if (!f) return;
+            html += kv(`${m} 拓扑`, `revision ${f.revision} · 策略 ${f.strategy || '—'} · 本地${f.local ? '✓' : '✗'} 云端${f.cloud ? '✓' : '✗'} 内容安全${f.contentSafety ? '✓' : '✗'}`);
+          });
+        }
+      } else {
+        html += '<div class="flow-hint">review-channels 暂不可读</div>';
+      }
+      if (dm) {
+        html += `<div class="flow-grp-title">GET /api/dual-mode</div>`;
+        html += kv('双审模式', dm.enabled || dm.dualMode ? '开' : '关');
+        if (dm.disputeStrategy) html += kv('分歧策略', dm.disputeStrategy);
+      }
+      box.dataset.loaded = '1';
+      box.innerHTML = html || '<div class="flow-hint">无派生数据</div>';
+    } catch (err) {
+      box.dataset.loaded = '1';
+      box.innerHTML = '<div class="flow-hint">派生视图读取失败</div>';
+    }
+  }
+  function kv(k, v) { return `<div class="flow-kv"><span>${esc(k)}</span><b>${esc(v)}</b></div>`; }
+
+  /* ───────────────────────── 抽屉 ───────────────────────── */
+
+  function renderDrawer() {
+    const panel = $('flowDrawerPanel');
+    const box = $('flowDrawer');
+    const title = $('flowDrawerTitle');
+    const flow = cur();
+    if (!panel || !box) return;
+    const id = F.selNode;
+    const n = flow && id ? flow.nodes.find((x) => x.id === id) : null;
+    if (!n) {
+      panel.style.display = '';
+      if (title) title.textContent = '节点参数';
+      box.innerHTML = '<div class="flow-hint">点击画布上的节点以编辑其参数；未选中节点时此处为空。</div>';
+      const del = $('flowBtnNodeDel'); if (del) del.style.display = 'none';
+      return;
+    }
+    const del = $('flowBtnNodeDel');
+    if (del) del.style.display = (n.type === 'input' || n.type === 'output') ? 'none' : '';
+    panel.style.display = '';
+    if (title) title.textContent = nodeTitle(n);
+
+    const desc = n.ref ? F.capsById[n.ref] : null;
+    let html = '';
+    html += `<div class="flow-field"><div class="flow-field-l">节点 ID</div><div class="flow-field-d" style="font-family:var(--font-mono)">${esc(n.id)} · type=${esc(n.type)}${desc ? ' · role=' + esc(desc.role) : ''}</div></div>`;
+
+    if (desc && desc.ready === false) {
+      html += `<div class="flow-nr">${notReadyHtml(desc)}</div>`;
+    }
+
+    if (n.type === 'input' || n.type === 'output') {
+      html += '<div class="flow-hint">输入 / 输出为固定节点：位置固定在画布顶 / 底，不可删除、不可复制。</div>';
+      box.innerHTML = html;
+      return;
+    }
+
+    if (n.type === 'merge') {
+      html += field('汇聚策略', `<select data-pkey="__strategy" data-structural="1">
+        ${['highest', 'lowest', 'priority'].map((s) => `<option value="${s}"${n.strategy === s ? ' selected' : ''}>${esc(STRATEGY_LABEL[s])}（${s}）</option>`).join('')}
+      </select>`, '并行分支的合并方式。「以指定分支为准」需为每条入边设置 priority。');
+      if (n.strategy === 'priority') {
+        const inc = flow.edges.filter((e) => e.to === n.id);
+        html += `<div class="flow-field"><div class="flow-field-l">分支优先级</div><div class="flow-checks">`
+          + (inc.length ? inc.map((e) => {
+            const src = flow.nodes.find((x) => x.id === e.from);
+            return `<div class="flow-prio-row"><span class="nm">${esc(src ? nodeTitle(src) : e.from)}</span>`
+              + `<input type="number" min="0" max="9999" step="1" data-pkey="__edge_priority" data-eid="${esc(e.id)}" value="${Number(e.priority) || 0}"></div>`;
+          }).join('') : '<div class="flow-hint">暂无入边</div>')
+          + '</div><div class="flow-field-d">数值最大者优先；并列时按入边声明顺序兜底。</div></div>';
+      }
+      html += field('categoriesMerge', `<select data-pkey="__catmerge" data-structural="1">
+        ${['winner', 'union'].map((s) => `<option value="${s}"${(n.categoriesMerge || 'winner') === s ? ' selected' : ''}>${s}</option>`).join('')}
+      </select>`, 'winner：只取胜出分支的标签；union：合并所有分支标签。');
+    } else {
+      const pFields = (desc ? desc.params : []).map((p) => renderParam(n, p, desc));
+      html += pFields.length ? pFields.join('') : '<div class="flow-hint">该节点无可配置参数。</div>';
+    }
+
+    // 通用执行参数
+    const pols = (desc && desc.failurePolicyOptions) || ['inherit', 'block', 'review'];
+    const pol = n.failurePolicy || 'inherit';
+    html += field('失败处置 failurePolicy', `<select data-pkey="__policy" data-structural="1">
+      ${pols.map((p) => `<option value="${p}"${pol === p ? ' selected' : ''}>${esc(POLICY_LABEL[p] || p)}</option>`).join('')}
+    </select>`, pol === 'skip' ? '⚠ skip 会让该节点失败时静默跳过，必须二次确认。' : '该节点执行失败时的处置方式。');
+    if (pol === 'skip') {
+      html += `<label class="flow-check"><input type="checkbox" data-pkey="__ackSkipRisk"${n.params && n.params.__ackSkipRisk === true ? ' checked' : ''}> 我已确认风险：允许该节点失败时跳过（否则保存会被拒绝）</label>`;
+    }
+    html += field('超时 timeoutMs', `<input type="number" min="100" max="300000" step="100" data-pkey="__timeout" value="${Number(n.timeoutMs) || (desc && desc.defaultTimeoutMs) || 15000}">`, '');
+
+    if (desc && desc.combineEditable) {
+      html += field('执行位置', `<select data-pkey="__combine" data-structural="1">
+        <option value="branch">主管线（作为并行分支参与合并）</option>
+        <option value="floor">下限层（并行最先执行，只升不降）</option>
+      </select>`, '下限层不参与分支比较，只把结果向上叠加。切换会移动该节点在图中的位置。');
+    }
+    box.innerHTML = html;
+  }
+
+  function field(label, ctrl, desc) {
+    return `<div class="flow-field"><div class="flow-field-l">${esc(label)}</div>${ctrl}`
+      + (desc ? `<div class="flow-field-d">${esc(desc)}</div>` : '') + '</div>';
+  }
+
+  function renderParam(n, p, desc) {
+    const disabled = desc && desc.ready === false ? ' disabled' : '';
+    const val = (n.params && Object.prototype.hasOwnProperty.call(n.params, p.key)) ? n.params[p.key] : p.default;
+    const key = `data-pkey="${esc(p.key)}"`;
+    let ctrl = '';
+    if (p.type === 'switch') {
+      ctrl = `<label class="flow-check"><input type="checkbox" ${key}${val === true ? ' checked' : ''}${disabled}> 已启用</label>`;
+    } else if (p.type === 'number' || p.type === 'slider') {
+      const min = Number.isFinite(p.min) ? ` min="${p.min}"` : '';
+      const max = Number.isFinite(p.max) ? ` max="${p.max}"` : '';
+      const step = p.type === 'slider' ? ' step="0.01"' : ' step="1"';
+      ctrl = `<input type="number"${min}${max}${step} ${key} value="${val === undefined || val === null ? '' : esc(val)}"${disabled}>`;
+    } else if (p.type === 'select') {
+      const opts = Array.isArray(p.options) ? p.options : [];
+      if (!opts.length && p.optionsFrom) {
+        ctrl = `<input type="text" ${key} value="${val === undefined || val === null ? '' : esc(val)}"${disabled} placeholder="留空使用全局默认">
+          <div class="flow-field-d">动态选项来源 ${esc(p.optionsFrom)}（当前按文本填写）</div>`;
+      } else {
+        ctrl = `<select ${key}${disabled}>`
+          + opts.map((o) => {
+            const v = o && typeof o === 'object' ? o.value : o;
+            const l = o && typeof o === 'object' ? (o.label || o.value) : o;
+            return `<option value="${esc(v)}"${String(val) === String(v) ? ' selected' : ''}>${esc(l)}</option>`;
+          }).join('') + '</select>';
+      }
+    } else if (p.type === 'multiselect') {
+      const opts = Array.isArray(p.options) ? p.options : [];
+      const arr = Array.isArray(val) ? val : [];
+      ctrl = '<div class="flow-checks">' + opts.map((o) => {
+        const v = o && typeof o === 'object' ? o.value : o;
+        const l = o && typeof o === 'object' ? (o.label || o.value) : o;
+        return `<label class="flow-check"><input type="checkbox" ${key} data-mval="${esc(v)}"${arr.includes(v) ? ' checked' : ''}${disabled}> ${esc(l)}</label>`;
+      }).join('') + '</div>';
+    } else if (p.type === 'level-map') {
+      ctrl = levelMapControl(n, p, val, disabled, key);
+    } else {
+      ctrl = `<input type="text" ${key} value="${val === undefined || val === null ? '' : esc(val)}"${disabled}>`;
+    }
+    return field(p.label || p.key, ctrl, p.desc || '');
+  }
+
+  /**
+   * level-map 控件：把「服务建议 → 风险等级」渲染成逐行下拉，而不是裸 JSON。
+   *
+   * 不变量（配置冲突 X24）：`block` 只应映射到 high/critical。
+   *   · 允许值优先取描述符下发的 p.levelMapBlockLevels（保持单一真相源）；
+   *   · 未下发时用内置兜底 DEFAULT_BLOCK_LEVELS；
+   *   · 下拉只列出允许值；若历史/导入配置里存着放宽值，**原样列出并黄色告警**，
+   *     不静默改写（架构 §15.4：前端不得自行修正配置）。
+   * 形状无法识别的 levelMap 回退为 JSON 文本域，避免误伤未知结构。
+   */
+  function levelMapControl(n, p, val, disabled, key) {
+    const stored = val && typeof val === 'object' && !Array.isArray(val) ? val : null;
+    const def = p.default && typeof p.default === 'object' && !Array.isArray(p.default) ? p.default : {};
+    const keys = [];
+    ['block', 'review', 'pass'].forEach((k) => { if (k in def || (stored && k in stored)) keys.push(k); });
+    Object.keys(def).concat(stored ? Object.keys(stored) : []).forEach((k) => { if (keys.indexOf(k) < 0) keys.push(k); });
+    if (!keys.length) keys.push('block', 'review', 'pass');
+
+    // 值必须都是字符串才认作「建议 → 等级」映射；否则回退 JSON 文本域
+    const allStringy = keys.every((k) => {
+      const v = stored && k in stored ? stored[k] : def[k];
+      return v === undefined || v === null ? false : typeof v === 'string';
+    });
+    if (stored && !allStringy) {
+      return `<textarea ${key}${disabled}>${esc(JSON.stringify(stored, null, 1))}</textarea>
+        <div class="flow-field-d">该值不是「服务建议 → 风险等级」形状，按 JSON 直接编辑。</div>`;
+    }
+
+    const allowed = Array.isArray(p.levelMapBlockLevels) && p.levelMapBlockLevels.length
+      ? p.levelMapBlockLevels.slice()
+      : DEFAULT_BLOCK_LEVELS;
+    let relaxed = false;
+
+    const rows = keys.map((k) => {
+      const cur = stored && Object.prototype.hasOwnProperty.call(stored, k) ? stored[k] : def[k];
+      const isBlock = k === 'block';
+      let opts = LEVELS;
+      if (isBlock) {
+        opts = allowed.slice();
+        if (cur && allowed.indexOf(cur) < 0) { opts = opts.concat([cur]); relaxed = true; }
+      }
+      const cell = '<option value="">（未设置）</option>'
+        + opts.map((lv) => `<option value="${esc(lv)}"${cur === lv ? ' selected' : ''}>${esc(lv)}${isBlock && allowed.indexOf(lv) < 0 ? ' ⚠ 已放宽拦截' : ''}</option>`).join('');
+      return `<div class="flow-lmap-row${isBlock && cur && allowed.indexOf(cur) < 0 ? ' locked' : ''}">`
+        + `<span class="flow-lmap-k">${esc(k)}<em>${esc(SUGGESTION_LABEL[k] || '自定义键')}</em></span>`
+        + `<select ${key} data-lmkey="${esc(k)}"${disabled}>${cell}</select></div>`;
+    }).join('');
+
+    let hint = `<div class="flow-field-d">「建议拦截」只允许映射到 ${esc(allowed.join(' / '))}：映射到更低等级会在反向投影回 suggestion 时把 block 变成 review/pass，等于放宽拦截（配置冲突 X24）。</div>`;
+    if (relaxed) {
+      hint = `<div class="flow-issue w" style="margin-top:6px"><span class="flow-issue-code">X24</span>`
+        + `<span class="flow-issue-body">当前 <b>block</b> 被映射到较低等级，拦截被放宽：内容安全垫片反向投影回 suggestion 时会变成 review/pass，削弱 v2.1.0 等价性。`
+        + `<div class="flow-issue-path">建议改为 high 或 critical</div></span></div>` + hint;
+    }
+    return `<div class="flow-lmap">${rows}</div>${hint}`;
+  }
+
+  /* ───────────────────────── 编辑操作 ───────────────────────── */
+
+  function pushUndo(snapshot) {
+    const d = curDraft();
+    if (!d) return;
+    F.undo.push(snapshot || JSON.stringify(d.flow));
+    if (F.undo.length > 10) F.undo.shift();
+  }
+  function undo() {
+    const d = curDraft();
+    if (!d || !F.undo.length) { showToast('没有可撤销的操作'); return; }
+    d.flow = normFlow(JSON.parse(F.undo.pop()));
+    if (!d.flow.nodes.some((n) => n.id === F.selNode)) F.selNode = null;
+    F.selEdge = null;
+    markDirty(); render(); scheduleValidate();
+  }
+
+  function genId(flow, ref) {
+    let base = String(ref).split('.').pop().toLowerCase().replace(/[^a-z0-9_]/g, '');
+    if (!/^[a-z]/.test(base)) base = 'n' + base;
+    base = base.slice(0, 19) || 'node';
+    const used = new Set();
+    flow.nodes.forEach((n) => used.add(n.id));
+    flow.floors.forEach((f) => { if (f.id) used.add(f.id); });
+    flow.edges.forEach((e) => used.add(e.id)); // 边 id 与节点 id 分属两个命名空间，但一并避让更安全
+    if (!used.has(base)) return base;
+    for (let i = 2; i < 200; i++) {
+      const c = base + i;
+      if (!used.has(c) && c.length <= 24) return c;
+    }
+    return 'n' + Math.random().toString(36).slice(2, 8);
+  }
+
+  function defaultParams(desc) {
+    const out = {};
+    (desc.params || []).forEach((p) => {
+      if (p.default === undefined) return;
+      out[p.key] = Array.isArray(p.default) ? p.default.slice() : p.default;
+    });
+    return out;
+  }
+
+  function addService(ref, x, y) {
+    const desc = F.capsById[ref];
+    if (!desc) { showToast('该服务未在注册表中，无法加入'); return; }
+    if (desc.ready === false) { showToast('该服务当前不可用，无法加入流程'); return; }
+    const flow = cur();
+    if (!flow) return;
+    if (desc.multiInstance === false && flow.nodes.some((n) => n.ref === ref)) {
+      showToast(`「${desc.title}」不支持多实例，画布中已存在`);
+      return;
+    }
+    pushUndo();
+    const id = genId(flow, ref);
+    flow.nodes.push({
+      id,
+      type: desc.role === 'contribute' ? 'contribute' : 'service',
+      ref,
+      params: defaultParams(desc),
+      failurePolicy: 'inherit',
+      timeoutMs: Number(desc.defaultTimeoutMs) || 15000,
+      position: { x, y },
+    });
+    const fi = flow.floors.findIndex((f) => f.ref === ref);
+    if (fi >= 0) {
+      flow.floors.splice(fi, 1);
+      showToast(`「${desc.title}」已从下限层移入主管线（可在抽屉切回）`);
+    } else {
+      showToast(`已添加「${desc.title}」`);
+    }
+    F.selNode = id; F.selEdge = null;
+    markDirty(); render(); scheduleValidate();
+  }
+
+  function addMerge(x, y) {
+    const flow = cur();
+    if (!flow) return;
+    pushUndo();
+    const id = genId(flow, 'merge');
+    flow.nodes.push({ id, type: 'merge', strategy: 'highest', categoriesMerge: 'winner', failurePolicy: 'inherit', timeoutMs: 1000, position: { x, y } });
+    F.selNode = id; F.selEdge = null;
+    markDirty(); render(); scheduleValidate();
+  }
+
+  function deleteNode(id) {
+    const flow = cur();
+    if (!flow) return;
+    const n = flow.nodes.find((x) => x.id === id);
+    if (!n) return;
+    if (n.type === 'input' || n.type === 'output') { showToast('输入 / 输出为固定节点，不可删除'); return; }
+    pushUndo();
+    flow.nodes = flow.nodes.filter((x) => x.id !== id);
+    flow.edges = flow.edges.filter((e) => e.from !== id && e.to !== id);
+    if (F.selNode === id) F.selNode = null;
+    markDirty(); render(); scheduleValidate();
+  }
+
+  function deleteEdge(id) {
+    const flow = cur();
+    if (!flow) return;
+    if (!flow.edges.some((e) => e.id === id)) return;
+    pushUndo();
+    flow.edges = flow.edges.filter((e) => e.id !== id);
+    if (F.selEdge === id) F.selEdge = null;
+    markDirty(); render(); scheduleValidate();
+  }
+
+  function reaches(flow, start, target) {
+    const adj = {};
+    flow.edges.forEach((e) => { (adj[e.from] = adj[e.from] || []).push(e.to); });
+    const seen = new Set();
+    const st = [start];
+    while (st.length) {
+      const id = st.pop();
+      if (id === target) return true;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      (adj[id] || []).forEach((x) => st.push(x));
+    }
+    return false;
+  }
+
+  /** 客户端即时拦截（服务端仍是最终权威）。返回空串表示可连接。 */
+  function linkError(from, to) {
+    const flow = cur();
+    if (!flow) return '流程未加载';
+    const byId = {};
+    flow.nodes.forEach((n) => { byId[n.id] = n; });
+    const a = byId[from], b = byId[to];
+    if (!a || !b) return '节点不存在';
+    if (from === to) return '不能连接到自身（E006）';
+    if (b.type === 'input') return '「输入」节点没有输入锚点';
+    if (a.type === 'output') return '「输出」节点没有输出锚点';
+    if (flow.edges.some((e) => e.from === from && e.to === to)) return '这条连线已存在（E015）';
+    if (reaches(flow, to, from)) return '会形成环：' + to + ' 已能到达 ' + from + '（E005）';
+    const inDeg = flow.edges.filter((e) => e.to === to).length;
+    if ((b.type === 'service' || b.type === 'contribute') && inDeg >= 1) return `「${nodeTitle(b)}」入度已满（≤1），请先接入汇聚节点`;
+    if (b.type === 'output' && inDeg >= 1) return '「输出」节点只能有 1 条入边（E008）';
+    if (a.type === 'merge' && flow.edges.some((e) => e.from === from)) return '「汇聚」节点只能有 1 条出边（E008）';
+    return '';
+  }
+
+  function connect(from, to, interactive) {
+    const why = linkError(from, to);
+    if (why) { if (interactive) showToast('无法连接：' + why); return false; }
+    const flow = cur();
+    pushUndo();
+    const id = genId(flow, 'e');
+    flow.edges.push({ id, from, to, priority: 0 });
+    markDirty(); render(); scheduleValidate();
+    return true;
+  }
+
+  function setCombine(n, mode) {
+    const flow = cur();
+    if (!flow) return;
+    pushUndo();
+    if (mode === 'floor') {
+      flow.nodes = flow.nodes.filter((x) => x.id !== n.id);
+      flow.edges = flow.edges.filter((e) => e.from !== n.id && e.to !== n.id);
+      flow.floors.push({
+        id: n.id, ref: n.ref, params: n.params || {},
+        timeoutMs: Number(n.timeoutMs) || 3000, enabled: true, deletable: true,
+      });
+      F.selNode = null;
+      showToast('已移入下限层：并行最先执行、只升不降');
+    } else {
+      const i = flow.floors.findIndex((f) => f.id === n.id || (f.ref === n.ref && !flow.nodes.some((x) => x.ref === f.ref)));
+      let params = {};
+      if (i >= 0) { params = flow.floors[i].params || {}; flow.floors.splice(i, 1); }
+      flow.nodes.push({
+        id: n.id, type: n.type, ref: n.ref, params, failurePolicy: n.failurePolicy || 'inherit',
+        timeoutMs: Number(n.timeoutMs) || 15000,
+        position: n.position || { x: 40, y: 320 },
+      });
+      F.selNode = n.id;
+      showToast('已移入主管线：作为并行分支参与合并');
+    }
+    markDirty(); render(); scheduleValidate();
+  }
+
+  /* ───────────────────────── 交互 ───────────────────────── */
+
+  /** 统一切换模态：同步分段按钮高亮、复制按钮文案与试运行样例输入区。 */
+  function switchModality(mod) {
+    F.modality = mod;
+    F.selNode = null; F.selEdge = null; F.undo = [];
+    const seg = $('flowModSeg');
+    if (seg) seg.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.mod === mod));
+    const t = $('flowBtnCopy');
+    if (t) t.textContent = mod === 'text' ? '复制到图像' : '复制到文本';
+    const img = $('flowDryImageWrap');
+    const txt = $('flowDryTextWrap');
+    const isImg = mod === 'image';
+    if (img) img.style.display = isImg ? '' : 'none';
+    if (txt) txt.style.display = isImg ? 'none' : '';
+    const out = $('flowDryOut');
+    if (out) out.innerHTML = '';
+  }
+
+  function toCanvas(ev) {
+    const r = $('flowCanvas').getBoundingClientRect();
+    return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  }
+
+  function scheduleGhost() {
+    if (F.rafId) return;
+    F.rafId = requestAnimationFrame(() => {
+      F.rafId = 0;
+      drawGhost();
+    });
+  }
+  function drawGhost() {
+    const d = F.drag;
+    const g = $('flowGhostG');
+    if (!g) return;
+    if (!d || d.mode !== 'link') { g.innerHTML = ''; return; }
+    const flow = cur();
+    const pos = edgeIndex(flow);
+    const a = pos[d.from];
+    if (!a) { g.innerHTML = ''; return; }
+    const dd = bez(a.x + NW / 2, a.y + NH, d.x, d.y);
+    g.innerHTML = `<path class="flow-ghost" d="${dd}"></path>`;
+  }
+  function scheduleEdges() {
+    if (F.rafId) return;
+    F.rafId = requestAnimationFrame(() => {
+      F.rafId = 0;
+      renderEdgePathsOnly();
+    });
+  }
+
+  function onDown(ev) {
+    if (ev.button !== 0 || !F.inited) return;
+    const canvas = $('flowCanvas');
+    if (!canvas) return;
+    const portEl = ev.target.closest ? ev.target.closest('.fn-port') : null;
+    if (portEl) {
+      if (portEl.dataset.port !== 'out') return;
+      const pt = toCanvas(ev);
+      F.drag = { mode: 'link', from: portEl.dataset.node, x: pt.x, y: pt.y };
+      canvas.classList.add('linking');
+      drawGhost();
+      ev.preventDefault();
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      return;
+    }
+    const nEl = ev.target.closest ? ev.target.closest('.flow-node') : null;
+    if (!nEl) return;
+    const flow = cur();
+    const n = flow && flow.nodes.find((x) => x.id === nEl.dataset.node);
+    if (!n) return;
+    F.selNode = n.id; F.selEdge = null;
+    renderDrawer();
+    document.querySelectorAll('.flow-node.selected').forEach((el) => el.classList.remove('selected'));
+    nEl.classList.add('selected');
+    if (n.type === 'input' || n.type === 'output' || !n.position) return;
+    const pt = toCanvas(ev);
+    F.drag = {
+      mode: 'node', id: n.id, moved: false,
+      dx: pt.x - n.position.x, dy: pt.y - n.position.y,
+      before: JSON.stringify(flow),
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    ev.preventDefault();
+  }
+
+  function onMove(ev) {
+    const d = F.drag;
+    if (!d) return;
+    const pt = toCanvas(ev);
+    if (d.mode === 'link') {
+      d.x = pt.x; d.y = pt.y;
+      scheduleGhost();
+      highlightPorts(ev);
+      return;
+    }
+    if (d.mode === 'node') {
+      const flow = cur();
+      const n = flow && flow.nodes.find((x) => x.id === d.id);
+      if (!n) return;
+      if (!d.moved) {
+        d.moved = true;
+        F.undo.push(d.before);
+        if (F.undo.length > 10) F.undo.shift();
+        const el0 = $('flowNodes').querySelector(`.flow-node[data-node="${d.id}"]`);
+        if (el0) el0.classList.add('dragging');
+      }
+      let nx = Math.round((pt.x - d.dx) / SNAP) * SNAP;
+      let ny = Math.round((pt.y - d.dy) / SNAP) * SNAP;
+      nx = Math.max(-NW / 2, Math.min(CW - NW / 2, nx));
+      ny = Math.max(-10, Math.min(CH - NH - 6, ny));
+      n.position = { x: nx, y: ny };
+      const el = $('flowNodes').querySelector(`.flow-node[data-node="${d.id}"]`);
+      if (el) el.style.transform = `translate(${nx}px,${ny}px)`;
+      scheduleEdges();
+    }
+  }
+
+  function highlightPorts(ev) {
+    const el = document.elementFromPoint(ev.clientX, ev.clientY);
+    const port = el && el.closest ? el.closest('.fn-port') : null;
+    document.querySelectorAll('.fn-port.hot,.fn-port.bad').forEach((p) => p.classList.remove('hot', 'bad'));
+    if (!port || port.dataset.port !== 'in') return;
+    const why = F.drag ? linkError(F.drag.from, port.dataset.node) : '无法连接';
+    port.classList.add(why ? 'bad' : 'hot');
+    port.title = why || '可连接';
+  }
+
+  function onUp(ev) {
+    const d = F.drag;
+    if (!d) return;
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    const canvas = $('flowCanvas');
+    if (canvas) canvas.classList.remove('linking');
+    F.drag = null;
+    const g = $('flowGhostG'); if (g) g.innerHTML = '';
+    document.querySelectorAll('.fn-port.hot,.fn-port.bad').forEach((p) => { p.classList.remove('hot', 'bad'); });
+    if (d.mode === 'link') {
+      const el = document.elementFromPoint(ev.clientX, ev.clientY);
+      const port = el && el.closest ? el.closest('.fn-port') : null;
+      if (port && port.dataset.port === 'in') connect(d.from, port.dataset.node, true);
+    } else if (d.mode === 'node' && d.moved) {
+      markDirty(); scheduleValidate();
+    }
+  }
+
+  /* ───────────────────────── 服务端交互 ───────────────────────── */
+
+  function scheduleValidate() {
+    clearTimeout(F.vtimer);
+    F.vtimer = setTimeout(() => { doValidate(true); }, 300);
+  }
+
+  async function doValidate(silent) {
+    const d = curDraft();
+    if (!d) return;
+    try {
+      const r = await fetch(`${API}/api/flow/${F.modality}/validate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ flow: { ...d.flow, modality: F.modality } }),
+      });
+      const data = await r.json().catch(() => ({}));
+      F.errors = Array.isArray(data.errors) ? data.errors : [];
+      F.warnings = Array.isArray(data.warnings) ? data.warnings : [];
+    } catch (err) {
+      F.errors = [{ code: 'E_NET', message: '校验请求失败：' + err.message, path: '' }];
+      F.warnings = [];
+    }
+    render({ canvasOnly: silent === true });
+  }
+
+  async function save() {
+    const d = curDraft();
+    if (!d) { showToast('流程尚未加载'); return; }
+    const btn = $('flowBtnSave');
+    if (btn) btn.disabled = true;
+    try {
+      // ★ 保存前先走一次 /validate：服务端仍是最终权威，但它让非法图连 PUT 都不发
+      await doValidate(true);
+      if (F.errors.length) {
+        showToast(`保存被拒绝：配置零写入（${F.errors.length} 个错误）`);
+        render();
+        return;
+      }
+      const r = await fetchWithPassword(`${API}/api/flow/${F.modality}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ flow: { ...d.flow, modality: F.modality }, baseRevision: d.revision }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (r.status === 409) {
+        showToast('配置已被其他地方修改，正在重新加载…');
+        await loadFlow(F.modality); render(); await loadDerived();
+        return;
+      }
+      if (!r.ok || data.ok !== true) {
+        F.errors = Array.isArray(data.errors) ? data.errors : [{ code: 'E_SAVE', message: data.error || '保存被拒绝', path: '' }];
+        F.warnings = Array.isArray(data.warnings) ? data.warnings : [];
+        showToast(`保存被拒绝：配置零写入（${F.errors.length} 个错误）`);
+        render();
+        return;
+      }
+      d.dirty = false;
+      await loadFlow(F.modality);
+      render();
+      await loadDerived();
+      showToast(`已保存并生效 · revision ${data.revision}`);
+    } catch (err) {
+      showToast('保存失败：' + err.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function copyToOther() {
+    const from = F.modality;
+    const to = from === 'text' ? 'image' : 'text';
+    const srcDraft = curDraft();
+    const warn = srcDraft && srcDraft.dirty
+      ? '\n\n⚠ 当前画布有未保存改动：「复制」以服务端已保存的流程为源，请先保存再复制。'
+      : '';
+    if (!confirm(`将「${from === 'text' ? '文本' : '图像'}流程」复制到「${to === 'text' ? '文本' : '图像'}流程」？\n复制时会自动剔除模态不匹配的节点；结果为未保存状态，可先检查再保存。${warn}`)) return;
+    try {
+      const r = await fetchWithPassword(`${API}/api/flow/copy`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from, to }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || !data.flow) { showToast('复制失败：' + (data.error || ('HTTP ' + r.status))); return; }
+      const src = cur();
+      const keptIds = new Set((data.flow.nodes || []).map((n) => n.id));
+      const dropped = (src.nodes || []).filter((n) => !keptIds.has(n.id))
+        .map((n) => {
+          const desc = F.capsById[n.ref];
+          return `${n.id}（${(desc && desc.title) || n.ref || n.type}）`;
+        });
+      const flow = normFlow({ ...data.flow, modality: to, revision: undefined });
+      if (needsLayout(flow)) autoLayout(flow);
+      F.drafts[to] = { flow, revision: F.drafts[to] ? F.drafts[to].revision : 0, dirty: true };
+      switchModality(to);
+      render();
+      await doValidate(false);
+      showToast(dropped.length
+        ? `已复制到${to === 'text' ? '文本' : '图像'}流程，剔除 ${dropped.length} 个模态不匹配节点：${dropped.join('、')}`
+        : `已复制到${to === 'text' ? '文本' : '图像'}流程（无节点被剔除）`);
+    } catch (err) {
+      showToast('复制失败：' + err.message);
+    }
+  }
+
+  async function resetFlow() {
+    if (!confirm(`将「${F.modality === 'text' ? '文本' : '图像'}流程」重置为由旧开关迁移生成的默认拓扑？当前未保存改动会丢失。`)) return;
+    try {
+      const r = await fetchWithPassword(`${API}/api/flow/${F.modality}/reset`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || !data.ok) { showToast('重置失败：' + (data.error || ('HTTP ' + r.status))); return; }
+      await loadFlow(F.modality);
+      render();
+      await loadDerived();
+      showToast('已重置为默认拓扑');
+    } catch (err) {
+      showToast('重置失败：' + err.message);
+    }
+  }
+
+  async function runDry() {
+    if (F.dryRunning) return;
+    const out = $('flowDryOut');
+    const d = curDraft();
+    if (!out || !d) return;
+    const sample = {};
+    if (F.modality === 'text') {
+      const t = $('flowDryText');
+      sample.text = t ? t.value : '';
+      if (!String(sample.text).trim()) { showToast('请先填写试运行样例文本'); return; }
+    } else {
+      const cap = $('flowDryCaption');
+      sample.caption = cap ? cap.value : '';
+      sample.imageBase64 = F.dryImageB64 || '';
+      if (!sample.imageBase64 && !String(sample.caption).trim()) { showToast('请先选择样例图片或填写附带文本'); return; }
+    }
+    F.dryRunning = true;
+    out.innerHTML = '<div class="empty-state">运行中…</div>';
+    try {
+      const r = await fetchWithPassword(`${API}/api/flow/${F.modality}/dry-run`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sample }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || data.ok !== true) {
+        const errs = Array.isArray(data.errors) ? data.errors : [];
+        out.innerHTML = `<div class="flow-issue e"><span class="flow-issue-code">DRY-RUN</span><span class="flow-issue-body">${esc(data.error || ('HTTP ' + r.status))}`
+          + (errs.length ? '<div class="flow-issue-path">' + errs.map((e) => esc((e.code || '') + ' ' + (e.message || ''))).join('<br>') + '</div>' : '')
+          + '</span></div>';
+        return;
+      }
+      F.dryResult = data;
+      renderDryResult(data);
+    } catch (err) {
+      out.innerHTML = `<div class="flow-issue e"><span class="flow-issue-code">NET</span><span class="flow-issue-body">请求失败：${esc(err.message)}</span></div>`;
+    } finally {
+      F.dryRunning = false;
+    }
+  }
+
+  function renderDryResult(data) {
+    const out = $('flowDryOut');
+    if (!out) return;
+    const v = data.verdict || {};
+    const tr = Array.isArray(data.node_traces) ? data.node_traces : [];
+    const stLabel = { ok: '成功', failed: '失败', skipped: '跳过' };
+    let html = '<div class="flow-grp-title">最终判定</div>';
+    html += kv('风险等级', v.risk_level || '—');
+    html += kv('处置动作', v.action || '—');
+    html += kv('结果来源', v.result_source || '—');
+    html += kv('降级 / fail-closed', v.degraded ? '是' : '否');
+    if (v.channels && Array.isArray(v.channels.skipped_channels) && v.channels.skipped_channels.length) {
+      html += kv('被跳过的通道', v.channels.skipped_channels.join('、'));
+    }
+    html += `<div class="flow-grp-title" style="margin-top:6px">节点 trace（${tr.length} 条）</div>`;
+    if (!tr.length) {
+      html += '<div class="flow-hint">本次执行没有产出节点 trace。</div>';
+    } else {
+      html += tr.map((t) => {
+        const st = String(t.status || '');
+        return `<div class="flow-trace-row ${esc(st)}">`
+          + `<span class="flow-trace-t">${esc(t.title || t.node_id || '')}</span>`
+          + `<span class="flow-trace-v">${esc(stLabel[st] || st)} · ${esc(t.elapsed_ms === undefined ? '—' : t.elapsed_ms)}ms</span>`
+          + `<span class="flow-trace-m">${esc(t.ref || '')}${t.risk_level ? ' · 等级 ' + esc(t.risk_level) : ''}${t.skip_reason ? ' · ' + esc(t.skip_reason) : ''}${t.failure_type ? ' · ' + esc(t.failure_type) : ''}</span>`
+          + (t.message ? `<span class="flow-trace-m">${esc(t.message)}</span>` : '')
+          + '</div>';
+      }).join('');
+    }
+    out.innerHTML = html;
+  }
+
+  /* ───────────────────────── 事件绑定 ───────────────────────── */
+
+  function bind() {
+    const canvas = $('flowCanvas');
+    if (canvas) {
+      canvas.addEventListener('pointerdown', onDown);
+      canvas.addEventListener('click', (ev) => {
+        const eg = ev.target.closest ? ev.target.closest('.flow-edge-g') : null;
+        if (eg) { F.selEdge = eg.dataset.edge; F.selNode = null; render(); return; }
+        const ne = ev.target.closest ? ev.target.closest('.flow-node') : null;
+        if (ne) return;
+        F.selEdge = null; F.selNode = null; render();
+      });
+      canvas.addEventListener('contextmenu', (ev) => {
+        const ne = ev.target.closest ? ev.target.closest('.flow-node') : null;
+        if (!ne) return;
+        ev.preventDefault();
+        deleteNode(ne.dataset.node);
+      });
+    }
+
+    const seg = $('flowModSeg');
+    if (seg) {
+      seg.addEventListener('click', (ev) => {
+        const btn = ev.target.closest('button[data-mod]');
+        if (!btn) return;
+        const mod = btn.dataset.mod;
+        if (mod === F.modality) return;
+        const d = curDraft();
+        if (d && d.dirty && !confirm(`当前「${F.modality === 'text' ? '文本' : '图像'}流程」有未保存的改动，切换会丢失。继续？`)) return;
+        switchModality(mod);
+        render();
+        doValidate(false);
+      });
+    }
+
+    const on = (id, fn) => { const el = $(id); if (el) el.addEventListener('click', fn); };
+    on('flowBtnSave', save);
+    on('flowBtnValidate', () => doValidate(false));
+    on('flowBtnDry', runDry);
+    on('flowBtnRunDry', runDry);
+    on('flowBtnCopy', copyToOther);
+    on('flowBtnLayout', () => {
+      const flow = cur();
+      if (!flow) return;
+      pushUndo(); autoLayout(flow); markDirty(); render();
+      showToast('已按依赖层级自动排版');
+    });
+    on('flowBtnUndo', undo);
+    on('flowBtnReset', resetFlow);
+    on('flowBtnDrawerBack', () => { F.selNode = null; F.selEdge = null; render(); });
+    on('flowBtnNodeDel', () => { if (F.selNode) deleteNode(F.selNode); });
+    on('flowBtnReloadCaps', async () => {
+      try { await reloadCaps(); render(); showToast('已刷新服务面板'); }
+      catch (err) { showToast('刷新失败：' + err.message); }
+    });
+
+    // 泳道（下限层 / 终裁层）
+    ['flowLaneFloors', 'flowLaneFinalizers'].forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      el.addEventListener('click', (ev) => {
+        const b = ev.target.closest('button[data-act]');
+        if (!b) return;
+        const d = curDraft();
+        if (!d) return;
+        const flow = d.flow;
+        const lane = b.dataset.lane;
+        const act = b.dataset.act;
+        const i = Number(b.dataset.i);
+        if (lane === 'floor') {
+          if (act === 'toggle') { pushUndo(); flow.floors[i].enabled = flow.floors[i].enabled === false; }
+          else if (act === 'rm') { pushUndo(); flow.floors.splice(i, 1); }
+          else if (act === 'tomain') {
+            const f = flow.floors[i];
+            const desc = F.capsById[f.ref];
+            if (desc && desc.multiInstance === false && flow.nodes.some((x) => x.ref === f.ref)) {
+              showToast('该服务不支持多实例，画布中已存在');
+              return;
+            }
+            pushUndo();
+            flow.floors.splice(i, 1);
+            flow.nodes.push({
+              id: genId(flow, f.ref), type: desc && desc.role === 'contribute' ? 'contribute' : 'service',
+              ref: f.ref, params: f.params || {}, failurePolicy: 'inherit',
+              timeoutMs: Number(f.timeoutMs) || (desc && desc.defaultTimeoutMs) || 15000,
+              position: { x: Math.round(CW / 2 - NW / 2), y: 320 },
+            });
+            showToast('已移入主管线');
+          }
+        } else {
+          if (act === 'toggle') { pushUndo(); flow.finalizers[i].enabled = flow.finalizers[i].enabled === false; }
+          else if (act === 'rm') { pushUndo(); flow.finalizers.splice(i, 1); }
+          else if (act === 'add') {
+            const ref = b.dataset.ref;
+            pushUndo();
+            flow.finalizers.push({ ref, enabled: true, params: {} });
+          }
+        }
+        markDirty(); render(); scheduleValidate();
+      });
+    });
+
+    // 服务面板：拖入画布
+    const pal = $('flowPalette');
+    if (pal) {
+      pal.addEventListener('click', (ev) => {
+        const fx = ev.target.closest('button[data-fix]');
+        if (fx) { ev.stopPropagation(); handleFix(fx.dataset.fix, fx.dataset.ref, fx.dataset.payload); return; }
+      });
+      pal.addEventListener('pointerdown', (ev) => {
+        const fx = ev.target.closest ? ev.target.closest('button[data-fix]') : null;
+        if (fx) return;
+        const item = ev.target.closest ? ev.target.closest('.flow-svc') : null;
+        if (!item) return;
+        const isMerge = item.dataset.structural === 'merge';
+        const ref = item.dataset.ref;
+        if (!isMerge && item.classList.contains('off')) {
+          ev.preventDefault();
+          const desc = F.capsById[ref];
+          showToast('该服务当前不可用：' + (desc ? notReadyText(desc) : ref));
+          return;
+        }
+        ev.preventDefault();
+        const ghost = document.createElement('div');
+        ghost.className = 'flow-dragghost';
+        ghost.textContent = item.dataset.title || ref || '节点';
+        document.body.appendChild(ghost);
+        const place = (x, y) => { ghost.style.left = (x + 12) + 'px'; ghost.style.top = (y + 12) + 'px'; };
+        place(ev.clientX, ev.clientY);
+        const mv = (e) => place(e.clientX, e.clientY);
+        const up = (e) => {
+          window.removeEventListener('pointermove', mv);
+          window.removeEventListener('pointerup', up);
+          ghost.remove();
+          const el = document.elementFromPoint(e.clientX, e.clientY);
+          if (!canvas || !el || !(el === canvas || canvas.contains(el))) return;
+          const r = canvas.getBoundingClientRect();
+          const x = Math.max(6, Math.min(CW - NW - 6, Math.round((e.clientX - r.left - NW / 2) / SNAP) * SNAP));
+          const y = Math.max(6, Math.min(CH - NH - 6, Math.round((e.clientY - r.top - NH / 2) / SNAP) * SNAP));
+          if (isMerge) addMerge(x, y); else addService(ref, x, y);
+        };
+        window.addEventListener('pointermove', mv);
+        window.addEventListener('pointerup', up);
+      });
+    }
+
+    // 抽屉表单
+    const drawer = $('flowDrawer');
+    if (drawer) {
+      drawer.addEventListener('input', onDrawerInput);
+      drawer.addEventListener('click', (ev) => {
+        const fx = ev.target.closest('button[data-fix]');
+        if (fx) handleFix(fx.dataset.fix, fx.dataset.ref, fx.dataset.payload);
+      });
+    }
+
+    // 问题列表：点击定位到节点/连线
+    const iss = $('flowIssues');
+    if (iss) {
+      iss.addEventListener('click', (ev) => {
+        const row = ev.target.closest('.flow-issue.clickable');
+        if (!row) return;
+        const p = row.dataset.goto || '';
+        let m = /^nodes\.([a-z][a-z0-9_]*)/.exec(p);
+        if (m) { F.selNode = m[1]; F.selEdge = null; render(); return; }
+        m = /^edges\.([A-Za-z0-9_]+)/.exec(p);
+        if (m) { F.selEdge = m[1]; F.selNode = null; render(); }
+      });
+    }
+
+    // 试运行图片读取
+    const dryOut = $('flowDryOut');
+    const dryPanel = dryOut ? dryOut.parentElement : null;
+    if (dryPanel) {
+      dryPanel.addEventListener('change', (ev) => {
+        if (ev.target.id !== 'flowDryFile') return;
+        const f = ev.target.files && ev.target.files[0];
+        if (!f) { F.dryImageB64 = ''; return; }
+        const fr = new FileReader();
+        fr.onload = () => {
+          F.dryImageB64 = String(fr.result).split(',')[1] || '';
+          showToast('样例图片已载入');
+        };
+        fr.onerror = () => showToast('图片读取失败');
+        fr.readAsDataURL(f);
+      });
+    }
+
+    // 键盘
+    document.addEventListener('keydown', (ev) => {
+      const tab = $('tab-flow');
+      if (!tab || tab.style.display === 'none') return;
+      const t = ev.target;
+      const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+      if ((ev.ctrlKey || ev.metaKey) && String(ev.key).toLowerCase() === 'z' && !typing) {
+        ev.preventDefault(); undo(); return;
+      }
+      if (typing) return;
+      if (ev.key === 'Delete' || ev.key === 'Backspace') {
+        if (F.selEdge) { ev.preventDefault(); deleteEdge(F.selEdge); }
+        else if (F.selNode) { ev.preventDefault(); deleteNode(F.selNode); }
+      }
+    });
+
+  }
+
+  function onDrawerInput(ev) {
+    const el = ev.target.closest ? ev.target.closest('[data-pkey]') : null;
+    if (!el) return;
+    const flow = cur();
+    if (!flow) return;
+    const key = el.dataset.pkey;
+    const n = flow.nodes.find((x) => x.id === F.selNode);
+    if (!n) return;
+
+    if (key === '__edge_priority') {
+      const e = flow.edges.find((x) => x.id === el.dataset.eid);
+      if (!e) return;
+      e.priority = Number(el.value) || 0;
+      markDirty(); scheduleValidate(); return;
+    }
+    if (key === '__strategy') { n.strategy = el.value; markDirty(); render(); scheduleValidate(); return; }
+    if (key === '__catmerge') { n.categoriesMerge = el.value; markDirty(); render(); scheduleValidate(); return; }
+    if (key === '__policy') {
+      n.failurePolicy = el.value;
+      if (el.value !== 'skip' && n.params) delete n.params.__ackSkipRisk;
+      markDirty(); render(); scheduleValidate(); return;
+    }
+    if (key === '__ackSkipRisk') {
+      n.params = n.params || {};
+      if (el.checked) n.params.__ackSkipRisk = true; else delete n.params.__ackSkipRisk;
+      markDirty(); scheduleValidate(); return;
+    }
+    if (key === '__timeout') {
+      const v = Number(el.value);
+      if (Number.isFinite(v)) n.timeoutMs = v;
+      markDirty(); scheduleValidate(); return;
+    }
+    if (key === '__combine') {
+      if (el.value === 'floor') setCombine(n, 'floor');
+      return;
+    }
+
+    const desc = n.ref ? F.capsById[n.ref] : null;
+    const spec = desc ? (desc.params || []).find((p) => p.key === key) : null;
+    n.params = n.params || {};
+    if (el.dataset.lmkey !== undefined) {
+      // level-map 单行改动：保留其它键，整份对象回写（空值 = 删除该键）
+      const lk = el.dataset.lmkey;
+      const curMap = (n.params[key] && typeof n.params[key] === 'object' && !Array.isArray(n.params[key]))
+        ? { ...n.params[key] } : {};
+      if (el.value === '') delete curMap[lk]; else curMap[lk] = el.value;
+      n.params[key] = curMap;
+      markDirty(); render(); scheduleValidate(); return;
+    }
+    if (el.dataset.mval !== undefined) {
+      const arr = Array.isArray(n.params[key]) ? n.params[key].slice() : [];
+      const v = el.dataset.mval;
+      if (el.checked) { if (arr.indexOf(v) < 0) arr.push(v); }
+      else { const i = arr.indexOf(v); if (i >= 0) arr.splice(i, 1); }
+      n.params[key] = arr;
+    } else if (el.type === 'checkbox') {
+      if (el.checked) n.params[key] = true; else delete n.params[key];
+    } else if (spec && (spec.type === 'number' || spec.type === 'slider')) {
+      if (el.value === '') delete n.params[key];
+      else n.params[key] = Number(el.value);
+    } else if (spec && spec.type === 'level-map') {
+      try { n.params[key] = JSON.parse(el.value); } catch (e) { /* 未完成输入，交由服务端 E013 报错 */ }
+    } else {
+      if (el.value === '') delete n.params[key]; else n.params[key] = el.value;
+    }
+    markDirty(); scheduleValidate();
+  }
+
+  function handleFix(type, ref, payload) {
+    if (type === 'copy') {
+      const text = payload || '';
+      if (!text) { showToast('没有可复制的命令'); return; }
+      const done = () => showToast('已复制：' + text);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+      } else {
+        fallbackCopy(text, done);
+      }
+      return;
+    }
+    const tab = payload || NR_GOTO[F.capsById[ref] && F.capsById[ref].notReadyReason] || 'config';
+    const el = document.querySelector(`.tab[data-tab="${tab}"]`);
+    if (el) { el.click(); showToast('已跳转，请在该页面完成配置后回到「审核流程」刷新'); }
+    else showToast('请前往对应配置页完成设置');
+  }
+
+  function fallbackCopy(text, done) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      done();
+    } catch (e) {
+      showToast('复制失败，请手动复制：' + text);
+    }
+  }
+
+  /* ───────────────────────── 生命周期 ───────────────────────── */
+
+  async function boot() {
+    try {
+      await reloadCaps();
+      await loadFlow('text');
+      await loadFlow('image');
+      F.modality = 'text';
+      bind();
+      render();
+      loadDerived();
+      doValidate(false);
+      const note = $('flowDryNote');
+      if (note) note.textContent = '试运行使用「已保存」的流程执行，样例内容不写入审计记录。';
+    } catch (err) {
+      console.error('[flow] 初始化失败', err);
+      const box = $('flowIssues');
+      if (box) box.innerHTML = `<div class="flow-issue e"><span class="flow-issue-code">INIT</span><span class="flow-issue-body">画布初始化失败：${esc(err.message)}</span></div>`;
+    }
+  }
+
+  async function onTabOpen() {
+    const tab = $('tab-flow');
+    if (!tab || tab.style.display === 'none') return;
+    if (!F.inited) { F.inited = true; switchModality('text'); await boot(); return; }
+    switchModality(F.modality);
+    const d = curDraft();
+    if (!d || !d.dirty) {
+      try {
+        await reloadCaps();
+        await loadFlow(F.modality);
+        const dd = curDraft();
+        if (dd && needsLayout(dd.flow)) autoLayout(dd.flow);
+        render();
+        doValidate(false);
+        loadDerived();
+      } catch (err) {
+        console.error('[flow] 刷新失败', err);
+      }
+    } else {
+      render();
+    }
+  }
+
+  // 初始化模态分段按钮的初始文案
+  const t0 = $('flowBtnCopy');
+  if (t0) t0.textContent = '复制到图像';
+
+  // Tab 激活钩子（必须在用户第一次点击前注册，故不放在 bind() 内）
+  document.querySelectorAll('.tab').forEach((tb) => {
+    tb.addEventListener('click', () => {
+      if (tb.dataset.tab !== 'flow') return;
+      onTabOpen();
+    });
+  });
 })();
 </script>
 </body>

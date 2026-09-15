@@ -103,6 +103,58 @@ function cloudVisionUsable(cfg, isSet) {
  * }} ConflictRule
  */
 
+/**
+ * 取已迁移的流程定义集合（未迁移或未启用时返回空数组）。
+ * @param {object} cfg 配置
+ * @returns {Array<{modality: string, flow: object}>} 流程列表
+ */
+function activeFlows(cfg) {
+  const flows = pick(cfg, 'moderation.flows', null);
+  if (!flows || typeof flows !== 'object' || flows.enabled === false) return [];
+  const out = [];
+  for (const modality of ['text', 'image']) {
+    const flow = flows[modality];
+    if (flow && typeof flow === 'object' && Array.isArray(flow.nodes) && flow.nodes.length > 0) {
+      out.push({ modality, flow });
+    }
+  }
+  return out;
+}
+
+/**
+ * 计算某模态流程中「在 input→output 通路上」的节点 id 集合。
+ * @param {object} flow 流程
+ * @returns {Set<string>} 通路节点集合
+ */
+function onPathNodes(flow) {
+  const nodes = Array.isArray(flow.nodes) ? flow.nodes : [];
+  const edges = Array.isArray(flow.edges) ? flow.edges : [];
+  const inputId = (nodes.find((n) => n && n.type === 'input') || {}).id;
+  const outputId = (nodes.find((n) => n && n.type === 'output') || {}).id;
+  const adj = new Map();
+  const radj = new Map();
+  for (const n of nodes) { if (n && n.id) { adj.set(n.id, []); radj.set(n.id, []); } }
+  for (const e of edges) {
+    if (adj.has(e.from) && adj.has(e.to)) { adj.get(e.from).push(e.to); radj.get(e.to).push(e.from); }
+  }
+  const walk = (start, graph) => {
+    const seen = new Set();
+    const st = start ? [start] : [];
+    while (st.length) {
+      const id = st.pop();
+      if (seen.has(id)) continue;
+      seen.add(id);
+      for (const x of graph.get(id) || []) st.push(x);
+    }
+    return seen;
+  };
+  const fwd = walk(inputId, adj);
+  const back = walk(outputId, radj);
+  const out = new Set();
+  for (const id of fwd) if (back.has(id)) out.add(id);
+  return out;
+}
+
 /** @type {ConflictRule[]} */
 const CONFLICT_RULES = [
   {
@@ -312,6 +364,109 @@ const CONFLICT_RULES = [
       + '标签贡献会被权限闸门拒绝（实际生效：图片标签联动降级为无操作）',
     fix: 'plugins.permissions（加入 "image:tag"）或 wd14.enabled',
   },
+  {
+    id: 'X17',
+    title: '存在「取最轻」汇聚策略（会放宽拦截）',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c) => activeFlows(c).some(({ flow }) => (flow.nodes || []).some((n) => n && n.type === 'merge' && n.strategy === 'lowest')),
+    message: () => '拓扑中存在 strategy=lowest 的汇聚节点，「取最轻」会放宽拦截（实际生效：按最轻分支结论放行）',
+    fix: '把该汇聚节点的 strategy 改为 highest，或确认后保留',
+  },
+  {
+    id: 'X18',
+    title: '存在 failurePolicy=skip 的节点（高危）',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c) => activeFlows(c).some(({ flow }) => (flow.nodes || []).some((n) => n && n.failurePolicy === 'skip')),
+    message: () => '拓扑中存在 failurePolicy=skip 的节点，该节点失败时不会触发 fail-closed（实际生效：按未执行降级）',
+    fix: '把该节点的 failurePolicy 改为 inherit/block/review',
+  },
+  {
+    id: 'X19',
+    title: '拓扑未接入任何有效判定节点',
+    severity: 'error',
+    resolution: 'warn',
+    when: (c) => activeFlows(c).some(({ flow }) => {
+      const path = onPathNodes(flow);
+      const judges = (flow.nodes || []).filter((n) => n && (n.type === 'service' || n.type === 'contribute') && path.has(n.id));
+      return judges.length === 0;
+    }),
+    message: () => '某模态拓扑在 input→output 通路上没有任何判定节点，该模态将只能依赖下限层（实际生效：仅下限层结论）',
+    fix: '在拓扑上至少接入一个判定节点（本地/云端/插件）',
+  },
+  {
+    id: 'X20',
+    title: '拓扑接入了未就绪的服务（幽灵选项）',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c, ctx) => activeFlows(c).some(({ flow }) => {
+      const path = onPathNodes(flow);
+      return (flow.nodes || []).some((n) => {
+        if (!n || !path.has(n.id)) return false;
+        if (n.ref === 'builtin.localModel') return ctx.localUsable !== true;
+        if (n.ref === 'builtin.cloudModel') return ctx.cloudUsable !== true;
+        return false;
+      });
+    }),
+    message: () => '拓扑接入了未配置/未启用的服务（如本地或云端通道未就绪），该节点执行时会被跳过'
+      + '（实际生效：skipped，不参与合并）。请补全配置或从拓扑移除该节点',
+    fix: '补全对应通道配置（ollama / qwenCloud），或在画布上移除该节点',
+  },
+  {
+    id: 'X21',
+    title: '拓扑存在未接入通路的孤立节点',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c) => activeFlows(c).some(({ flow }) => {
+      const path = onPathNodes(flow);
+      return (flow.nodes || []).some((n) => n && n.id && !path.has(n.id));
+    }),
+    message: () => '拓扑存在不在 input→output 通路上的孤立节点，它们不会参与执行'
+      + '（实际生效：不执行，仅占位）。可在画布上连线或删除',
+    fix: '在画布上把孤立节点接入通路，或删除它',
+  },
+  {
+    id: 'X22',
+    title: '拓扑引用了插件节点但插件系统已关闭',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c) => pick(c, 'plugins.enabled', true) === false
+      && activeFlows(c).some(({ flow }) => (flow.nodes || []).some((n) => n && typeof n.ref === 'string' && n.ref.startsWith('plugin.'))),
+    message: () => '插件系统已关闭（plugins.enabled=false），但拓扑中仍存在插件节点；这些节点执行时会被跳过（实际生效：skipped）',
+    fix: '启用插件系统，或在画布上移除插件节点',
+  },
+  {
+    id: 'X23',
+    title: '顶层 reviewChannels 与权威配置不一致',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c) => {
+      const top = pick(c, 'reviewChannels', null);
+      const auth = pick(c, 'moderation.reviewChannels', null);
+      if (!top || typeof top !== 'object' || !auth || typeof auth !== 'object') return false;
+      return Object.keys(top).some((k) => k in auth && top[k] !== auth[k]);
+    },
+    message: () => '检测到顶层 reviewChannels 与 moderation.reviewChannels 不一致，已以 moderation.reviewChannels 为唯一权威'
+      + '（实际生效：moderation.reviewChannels；顶层字段保留仅为兼容已存盘配置）',
+    fix: '删除顶层 reviewChannels，或令其与 moderation.reviewChannels 一致',
+  },
+  {
+    id: 'X24',
+    title: '风险映射把「拦截」降级为放行',
+    severity: 'warn',
+    resolution: 'warn',
+    when: (c) => activeFlows(c).some(({ flow }) => (flow.nodes || []).some((n) => {
+      const levelMap = n && n.params && n.params.levelMap;
+      if (!levelMap || typeof levelMap !== 'object') return false;
+      if (levelMap.block === undefined) return false;
+      return !['high', 'critical'].includes(levelMap.block);
+    })),
+    message: () => '存在 levelMap 把 block（服务建议拦截）映射到 medium/low/safe 的节点：'
+      + '投影回 suggestion 时会变成 review/pass，削弱 v2.1.0 等价性（实际生效：拦截被放宽）。'
+      + '建议 block 分支只映射到 high 或 critical',
+    fix: '把该节点的 levelMap.block 改为 high 或 critical',
+  },
 ];
 
 /**
@@ -464,4 +619,6 @@ module.exports = {
   pick,
   localVisionUsable,
   cloudVisionUsable,
+  activeFlows,
+  onPathNodes,
 };

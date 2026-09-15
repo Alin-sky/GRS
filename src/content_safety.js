@@ -1,398 +1,205 @@
-const crypto = require('crypto');
-const GreenClient = require('@alicloud/green20220302').default;
-const models = require('@alicloud/green20220302/dist/models/model');
+/**
+ * 内容安全兼容垫片（src/content_safety.js）
+ *
+ * ★ v2.2.0 定位（架构 §8.1 步骤 ③）：阿里云内容安全的**客户端构造 / 响应归一化 / 缓存**
+ *   已整体迁出到 `plugins/aliyun-content-safety/`。本文件退化为**兼容垫片**：
+ *     - 保留三个既有导出（`getContentSafetyStatus` / `moderateTextContentSafety` /
+ *       `moderateImageContentSafety`），保证 `src/server.js`、`src/moderator.js`、
+ *       `src/comparator.js` 等既有调用点不被打断；
+ *     - 内部改为**经 capability-broker → 插件节点**（`text.verdict` / `image.verdict`）；
+ *     - **不再 require SDK、不再构造 client、不再持有缓存** → 插件禁用时核心零残留调用路径（PRD F15）。
+ *
+ * ★ 安全性质：插件未启用 / 未就绪时返回 `{available:false, skipped:true, reason}`，
+ *   由调用方（moderator 的下限层叠加）按「只升不降」语义跳过，绝不因此放行。
+ */
+
+'use strict';
+
 const { loadConfig, isValueSet } = require('./config');
-const { logError, logInfo } = require('./logger');
+const { logWarn } = require('./logger');
+const capabilityBroker = require('./capability-broker');
 
-const config = loadConfig();
-let cachedClient = null;
-let cachedClientKey = '';
+/** 提供内容安全能力的插件 id（与 plugins/aliyun-content-safety/manifest.json 一致）。 */
+const PLUGIN_ID = 'aliyun-content-safety';
 
-// ─── 文本审核结果缓存（降本核心） ───
-// 绿网文本审核按次计费，同一文本在短时间（QQ 复读/口令/广告、每日对比审核重放）内会重复调用。
-// 对文本做 MD5 去重，24h 内相同内容直接复用上次结果，把「实时 2 服务 + 对比审核 2 服务」的重复计费压到 1 次。
-const textCache = new Map(); // md5 -> { result, ts }
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 小时
-const CACHE_MAX = 20000; // LRU 上限，避免内存无限膨胀
-
-function textMd5(text) {
-  return crypto.createHash('md5').update(String(text)).digest('hex');
-}
-
-function cacheGet(key) {
-  const entry = textCache.get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.ts > CACHE_TTL_MS) {
-    textCache.delete(key);
-    return null;
-  }
-  return entry.result;
-}
-
-function cacheSet(key, result) {
-  if (textCache.size >= CACHE_MAX) {
-    // 逐出最旧的一项（Map 迭代顺序即插入顺序）
-    const oldestKey = textCache.keys().next().value;
-    if (oldestKey !== undefined) textCache.delete(oldestKey);
-  }
-  textCache.set(key, { result, ts: Date.now() });
-}
-
-function clearTextCache() {
-  const n = textCache.size;
-  textCache.clear();
-  return n;
-}
-
-const CATEGORY_MAP = {
-  politics: 'political',
-  political: 'political',
-  porn: 'pornographic',
-  pornography: 'pornographic',
-  sexy: 'pornographic',
-  ad: 'marketing',
-  advertisement: 'marketing',
-  spam: 'marketing',
-  marketing: 'marketing',
-  terrorism: 'violence',
-  violent: 'violence',
-  violence: 'violence',
-  abuse: 'abuse',
-  insult: 'abuse',
-  harassment: 'abuse',
-  contraband: 'illegal',
-  illegal: 'illegal',
-  gambling: 'gambling',
-  fraud: 'gambling',
-  privacy: 'privacy',
-  personal: 'privacy',
-  disgusting: 'grotesque',
-  grotesque: 'grotesque',
+/** 能力 → 插件节点 ref。 */
+const NODE_REF = {
+  text: `plugin.${PLUGIN_ID}.text`,
+  image: `plugin.${PLUGIN_ID}.image`,
 };
 
+/** 内容安全配置（字段**未搬迁**，仍读 config.contentSafety.*）。 */
 function getSafetyConfig() {
-  return config.contentSafety || {};
+  return loadConfig().contentSafety || {};
 }
 
+/** 是否已启用且配好 AccessKey（占位符视为未配置）。 */
 function isConfigured() {
   const safety = getSafetyConfig();
-  // 占位符形态的 Key（如 YOUR_ALIBABA_CLOUD_ACCESS_KEY_ID）视为未配置：
-  // 否则每次审核都会真打阿里云接口并返回 InvalidAccessKeyId，形成刷屏报错。
   return Boolean(safety.enabled && isValueSet(safety.accessKeyId) && isValueSet(safety.accessKeySecret));
 }
 
+/** 插件是否提供了内容安全能力（未启用 / 未装载 → false）。 */
+function hasProvider() {
+  return capabilityBroker.has('text.verdict') || capabilityBroker.has('image.verdict');
+}
+
+/**
+ * SDK 是否已安装（仅用于状态展示；实际装载归属插件，核心不再 require）。
+ * @returns {boolean} 是否已安装
+ */
+function isSdkInstalled() {
+  try {
+    require.resolve('@alicloud/green20220302', { paths: [__dirname] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 内容安全状态（供 GET /api/content-safety/status 与画布置灰使用）。
+ * @returns {object} 状态
+ */
 function getStatus() {
   const safety = getSafetyConfig();
   const configured = Boolean(isValueSet(safety.accessKeyId) && isValueSet(safety.accessKeySecret));
-  
-  // 兼容旧配置：textService (单值) → textServices (数组)
+  const installed = isSdkInstalled();
+  const pluginAvailable = hasProvider();
+
   let textServices = [];
   if (Array.isArray(safety.textServices) && safety.textServices.length > 0) {
     textServices = safety.textServices.filter(Boolean);
   } else if (safety.textService) {
     textServices = [safety.textService];
   }
-  
+
+  // 状态优先级：invalid > missing-deps > not-configured > disabled > ready
+  let reason = '';
+  if (!pluginAvailable) reason = 'plugin_disabled';
+  else if (!installed) reason = 'missing-deps';
+  else if (!configured) reason = 'not-configured';
+  else if (safety.enabled !== true) reason = 'disabled';
+
   return {
     enabled: safety.enabled === true,
     configured,
-    ready: safety.enabled === true && configured,
+    installed,
+    pluginAvailable,
+    ready: safety.enabled === true && configured && pluginAvailable,
+    reason,
+    installHint: installed ? '' : 'npm i @alicloud/green20220302',
     textEnabled: safety.textEnabled !== false,
     imageEnabled: safety.imageEnabled !== false,
     region: safety.region || 'cn-shanghai',
-    endpoint: safety.endpoint || 'green-cip.cn-shanghai.aliyuncs.com',
+    endpoint: safety.endpoint || 'cn-shanghai',
     textServices,
     imageService: safety.imageService || 'query_security_check',
   };
 }
 
-function getClient() {
-  const safety = getSafetyConfig();
-  if (!isConfigured()) {
-    throw new Error('阿里云内容安全未启用或 AccessKey 未配置');
-  }
-
-  const clientKey = [
-    safety.accessKeyId,
-    safety.region || 'cn-shanghai',
-    safety.endpoint || 'green-cip.cn-shanghai.aliyuncs.com',
-    safety.timeout || 10000,
-  ].join('|');
-
-  if (cachedClient && cachedClientKey === clientKey) return cachedClient;
-
-  cachedClient = new GreenClient({
-    accessKeyId: safety.accessKeyId,
-    accessKeySecret: safety.accessKeySecret,
-    regionId: safety.region || 'cn-shanghai',
-    endpoint: safety.endpoint || 'green-cip.cn-shanghai.aliyuncs.com',
-    connectTimeout: Math.min(Number(safety.timeout) || 10000, 3000),
-    readTimeout: Number(safety.timeout) || 10000,
-  });
-  cachedClientKey = clientKey;
-  return cachedClient;
-}
-
-function toPlain(value) {
-  if (value === undefined || value === null) return value;
+/**
+ * 经 broker 调用内容安全插件节点。
+ * @param {'text'|'image'} modality 模态
+ * @param {object} payload 载荷（{text} 或 {imageBase64, caption}）
+ * @returns {Promise<object|null>} 插件判定（ModerationVerdict）或 null
+ */
+async function invokePluginNode(modality, payload) {
+  const capability = modality === 'image' ? 'image.verdict' : 'text.verdict';
+  if (!capabilityBroker.hasOwner(capability, PLUGIN_ID)) return null;
+  const request = {
+    ref: NODE_REF[modality],
+    params: {},
+    payload,
+    modality,
+    work: { tags: [], labels: [], evidence: [] },
+    meta: {},
+  };
   try {
-    return JSON.parse(JSON.stringify(value));
-  } catch {
-    return value;
+    return await capabilityBroker.invokeCall(capability, PLUGIN_ID, request);
+  } catch (err) {
+    logWarn('content_safety', `内容安全插件调用异常: ${err && err.message}`);
+    return null;
   }
 }
 
-function asArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-
-function collectResultItems(value, items = [], visited = new Set()) {
-  if (!value || typeof value !== 'object' || visited.has(value)) return items;
-  visited.add(value);
-
-  const label = String(value.label || value.Label || '').toLowerCase();
-  const suggestion = String(value.suggestion || value.Suggestion || '').toLowerCase();
-  const level = String(value.level || value.Level || '').toLowerCase();
-  const confidence = Number(value.confidence ?? value.Confidence);
-  const description = value.description || value.Description || '';
-
-  if (label || suggestion || level || Number.isFinite(confidence)) {
-    items.push({ label, suggestion, level, confidence, description: String(description) });
-  }
-
-  for (const child of Object.values(value)) {
-    if (child && typeof child === 'object') collectResultItems(child, items, visited);
-  }
-  return items;
-}
-
-function normalizeContentSafetyResponse(response, channel, elapsedMs) {
-  const body = toPlain(response?.body || response) || {};
-  const code = Number(body.code ?? body.Code ?? response?.statusCode ?? 0);
-  const message = body.message || body.Message || '';
-  const requestId = body.requestId || body.RequestId || '';
-
-  if (code !== 200) {
-    throw new Error(`阿里云内容安全返回异常: code=${code || 'unknown'}, message=${message || 'unknown'}`);
-  }
-
-  const data = body.data || body.Data || {};
-  const items = collectResultItems(data);
-  const suggestions = items.map((item) => item.suggestion).filter(Boolean);
-  const globalSuggestion = String(data.suggestion || data.Suggestion || '').toLowerCase();
-  const suggestion = globalSuggestion === 'block' || suggestions.includes('block')
+/**
+ * 把插件返回的 ModerationVerdict 投影回 v2.1.0 的 contentSafetyResult 形状，
+ * 供 moderator 的 `applyContentSafetyResult`（只升不降）沿用，确保行为等价。
+ * @param {object} verdict 插件判定
+ * @returns {object} contentSafetyResult
+ */
+function verdictToLegacy(verdict) {
+  const level = verdict.risk_level;
+  const suggestion = (level === 'high' || level === 'critical')
     ? 'block'
-    : globalSuggestion === 'review' || suggestions.includes('review')
-      ? 'review'
-      : 'pass';
-
-  const categoryScores = {};
-  const categories = new Set();
-  const matchedLabels = [];
-  for (const item of items) {
-    const category = CATEGORY_MAP[item.label];
-    if (!category) continue;
-    const score = Number.isFinite(item.confidence) ? Math.max(0, Math.min(100, Math.round(item.confidence))) : suggestion === 'block' ? 85 : 60;
-    categoryScores[category] = Math.max(categoryScores[category] || 0, score);
-    categories.add(category);
-    matchedLabels.push({
-      label: item.label,
-      description: item.description || '',
-      confidence: score,
-      suggestion: item.suggestion || suggestion,
-    });
-  }
-
-  // 服务建议拦截但未返回可映射标签时，保留为通用违法风险，防止审核结果被静默忽略。
-  if (suggestion === 'block' && categories.size === 0) {
-    categories.add('illegal');
-    categoryScores.illegal = 85;
-  }
-
-  const riskLevel = suggestion === 'block' ? 'high' : suggestion === 'review' ? 'medium' : 'safe';
-  const confidenceValues = matchedLabels.map((item) => item.confidence);
-  const confidence = confidenceValues.length > 0
-    ? Math.max(...confidenceValues) / 100
-    : suggestion === 'pass' ? 1 : suggestion === 'review' ? 0.6 : 0.85;
-
+    : (level === 'medium' || level === 'review') ? 'review' : 'pass';
   return {
     available: true,
     provider: 'aliyun-content-safety',
-    channel,
     suggestion,
-    risk_level: riskLevel,
-    categories: Array.from(categories),
-    category_scores: categoryScores,
-    confidence,
-    matched_labels: matchedLabels,
-    request_id: requestId,
-    elapsed_ms: elapsedMs,
+    risk_level: level,
+    categories: Array.isArray(verdict.categories) ? verdict.categories : [],
+    category_scores: verdict.category_scores || {},
+    confidence: Number.isFinite(verdict.confidence) ? verdict.confidence : 0.8,
+    matched_labels: [],
+    reason: verdict.reason || '',
   };
 }
 
+/**
+ * 构造「未就绪」结果（跳过语义，绝不视为 safe）。
+ * @param {object} status 状态
+ * @param {boolean} textEnabled 该模态是否开启
+ * @returns {object} 跳过结果
+ */
+function skipResult(status, textEnabled) {
+  const reason = !status.pluginAvailable ? 'plugin_disabled'
+    : !status.ready ? 'disabled_or_unconfigured'
+      : (textEnabled ? 'unavailable' : 'modal_disabled');
+  return { available: false, skipped: true, reason };
+}
+
+/**
+ * 文本内容安全审核（经插件）。
+ * @param {string} text 文本
+ * @returns {Promise<object>} contentSafetyResult
+ */
 async function moderateTextContentSafety(text) {
   const status = getStatus();
-  if (!status.ready || !status.textEnabled) {
-    return { available: false, skipped: true, reason: !status.ready ? 'disabled_or_unconfigured' : 'text_disabled' };
-  }
-
-  const textServices = status.textServices.length > 0 ? status.textServices : ['comment_detection'];
-
-  // 缓存命中：24h 内相同文本直接复用，省一次计费调用
-  const cacheKey = textMd5(text);
-  const cached = cacheGet(cacheKey);
-  if (cached) {
-    logInfo('content_safety', `文本审核缓存命中: suggestion=${cached.suggestion}, risk=${cached.risk_level}`);
-    return { ...cached, cached: true, elapsed_ms: 0 };
-  }
-
-  const start = Date.now();
-
-  if (textServices.length === 1) {
-    // 单服务：直接调用
-    try {
-      const client = getClient();
-      const request = new models.TextModerationRequest({
-        service: textServices[0],
-        serviceParameters: JSON.stringify({ content: text }),
-      });
-      const response = await client.textModeration(request);
-      const result = normalizeContentSafetyResponse(response, 'text', Date.now() - start);
-      result.services = textServices;
-      cacheSet(cacheKey, result);
-      logInfo('content_safety', `文本审核完成 [${textServices[0]}]: suggestion=${result.suggestion}, risk=${result.risk_level}, elapsed=${result.elapsed_ms}ms`);
-      return result;
-    } catch (err) {
-      logError('content_safety', `文本审核失败 [${textServices[0]}]: ${err.message}`);
-      return { available: false, error: err.message, channel: 'text', services: textServices, elapsed_ms: Date.now() - start };
-    }
-  }
-
-  // 多服务：并行调用，合并结果
-  const results = await Promise.allSettled(textServices.map(async (service) => {
-    const client = getClient();
-    const request = new models.TextModerationRequest({
-      service,
-      serviceParameters: JSON.stringify({ content: text }),
-    });
-    return await client.textModeration(request);
-  }));
-
-  const elapsed = Date.now() - start;
-  const parsedResults = [];
-  const errors = [];
-
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    if (r.status === 'fulfilled') {
-      try {
-        parsedResults.push(normalizeContentSafetyResponse(r.value, 'text', elapsed));
-      } catch (err) {
-        errors.push({ service: textServices[i], error: err.message });
-      }
-    } else {
-      errors.push({ service: textServices[i], error: r.reason?.message || String(r.reason) });
-    }
-  }
-
-  if (parsedResults.length === 0) {
-    logError('content_safety', `所有文本审核服务均失败: ${errors.map(e => `${e.service}(${e.error})`).join('; ')}`);
-    return { available: false, error: errors.map(e => e.error).join('; '), channel: 'text', services: textServices, elapsed_ms: elapsed };
-  }
-
-  // 合并多个服务结果：取最高风险、合并标签和分类
-  const merged = mergeTextResults(parsedResults, textServices, elapsed);
-  if (errors.length > 0) merged.partial_errors = errors;
-  cacheSet(cacheKey, merged);
-  logInfo('content_safety', `多服务文本审核完成 [${textServices.join(',')}]: suggestion=${merged.suggestion}, risk=${merged.risk_level}, services=${parsedResults.length}/${textServices.length}成功, elapsed=${elapsed}ms`);
-  return merged;
+  if (!status.ready || !status.textEnabled) return skipResult(status, status.textEnabled);
+  const verdict = await invokePluginNode('text', { text });
+  if (!verdict) return { available: false, skipped: true, reason: 'plugin_disabled' };
+  return verdictToLegacy(verdict);
 }
 
-function mergeTextResults(results, services, elapsed) {
-  const suggestionOrder = { block: 3, review: 2, pass: 1 };
-  const riskOrder = { critical: 4, high: 3, medium: 2, low: 1, safe: 0 };
-
-  let maxSuggestion = 'pass';
-  let maxRisk = 'safe';
-  const categoryScores = {};
-  const categories = new Set();
-  const matchedLabels = [];
-  const perService = [];
-
-  for (const r of results) {
-    perService.push({
-      service: r.service || services[0],
-      suggestion: r.suggestion,
-      risk_level: r.risk_level,
-      matched_labels: r.matched_labels || [],
-    });
-
-    if ((suggestionOrder[r.suggestion] || 0) > (suggestionOrder[maxSuggestion] || 0)) {
-      maxSuggestion = r.suggestion;
-    }
-    if ((riskOrder[r.risk_level] || 0) > (riskOrder[maxRisk] || 0)) {
-      maxRisk = r.risk_level;
-    }
-    for (const [cat, score] of Object.entries(r.category_scores || {})) {
-      categoryScores[cat] = Math.max(categoryScores[cat] || 0, score);
-    }
-    for (const cat of (r.categories || [])) {
-      categories.add(cat);
-    }
-    for (const label of (r.matched_labels || [])) {
-      matchedLabels.push({ ...label, source_service: r.service || 'unknown' });
-    }
-  }
-
-  const confidenceValues = matchedLabels.map((item) => item.confidence);
-  const confidence = confidenceValues.length > 0
-    ? Math.max(...confidenceValues) / 100
-    : maxSuggestion === 'pass' ? 1 : maxSuggestion === 'review' ? 0.6 : 0.85;
-
-  return {
-    available: true,
-    provider: 'aliyun-content-safety',
-    channel: 'text',
-    services,
-    suggestion: maxSuggestion,
-    risk_level: maxRisk,
-    categories: Array.from(categories),
-    category_scores: categoryScores,
-    confidence,
-    matched_labels: matchedLabels,
-    per_service: perService,
-    elapsed_ms: elapsed,
-    merged: true,
-  };
-}
-
+/**
+ * 图片内容安全审核（经插件）。
+ * @param {string} imageBase64 base64 图片
+ * @param {string} [text] 附带文本
+ * @returns {Promise<object>} contentSafetyResult
+ */
 async function moderateImageContentSafety(imageBase64, text = '') {
   const status = getStatus();
-  if (!status.ready || !status.imageEnabled) {
-    return { available: false, skipped: true, reason: !status.ready ? 'disabled_or_unconfigured' : 'image_disabled' };
-  }
+  if (!status.ready || !status.imageEnabled) return skipResult(status, status.imageEnabled);
+  const verdict = await invokePluginNode('image', { imageBase64, caption: text });
+  if (!verdict) return { available: false, skipped: true, reason: 'plugin_disabled' };
+  return verdictToLegacy(verdict);
+}
 
-  const start = Date.now();
-  try {
-    const client = getClient();
-    // MultiModalGuardForBase64 为 Green/2022-03-02 官方同步 Base64 图片检测接口，避免为现有图片输入额外落盘或上传 OSS。
-    const request = new models.MultiModalGuardForBase64Request({
-      service: status.imageService,
-      serviceParameters: JSON.stringify(text ? { content: text } : {}),
-      imageBase64Str: imageBase64,
-    });
-    const response = await client.multiModalGuardForBase64(request);
-    const result = normalizeContentSafetyResponse(response, 'image', Date.now() - start);
-    logInfo('content_safety', `图片审核完成: suggestion=${result.suggestion}, risk=${result.risk_level}, elapsed=${result.elapsed_ms}ms`);
-    return result;
-  } catch (err) {
-    logError('content_safety', `图片审核失败: ${err.message}`);
-    return { available: false, error: err.message, channel: 'image', elapsed_ms: Date.now() - start };
-  }
+/**
+ * 兼容保留：文本缓存已迁至插件内部，此处为无操作。
+ * @returns {number} 固定返回 0
+ */
+function clearTextCache() {
+  return 0;
 }
 
 module.exports = {
   getContentSafetyStatus: getStatus,
+  isSdkInstalled,
+  isConfigured,
+  hasProvider,
   moderateTextContentSafety,
   moderateImageContentSafety,
   clearTextCache,

@@ -20,6 +20,7 @@ const broker = require('./capability-broker');
 const contract = require('./host-api/contract');
 const eventRegistry = require('./host-api/event-registry');
 const boundary = require('../scripts/lint-plugin-boundary');
+const flowRegistry = require('./flow/registry');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
 const PLUGINS_DIR = path.join(PROJECT_ROOT, 'plugins');
@@ -44,6 +45,167 @@ const PERMISSION_ENUM = new Set(contract.PERMISSIONS);
 const MAX_PACKAGE_BYTES = 50 * 1024 * 1024;
 /** 回收目录保留天数 */
 const TRASH_KEEP_DAYS = 7;
+
+/** 可选依赖白名单（★ 单一来源：契约层） */
+const OPTIONAL_WHITELIST = contract.OPTIONAL_DEPENDENCY_SET;
+/** 可选依赖「至少其一」约束（nsfwjs → TF.js 后端二选一） */
+const OPTIONAL_ANY_OF = contract.OPTIONAL_DEPENDENCY_ANY_OF;
+
+/**
+ * 判定一个 npm 包是否可被 require 解析（不抛异常）。
+ * @param {string} pkg 包名
+ * @returns {boolean} 是否可解析
+ */
+function canResolve(pkg) {
+  try {
+    require.resolve(pkg, { paths: [PROJECT_ROOT] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 探测 manifest 声明的可选依赖是否齐备（架构 §8.2）。
+ * 缺失时**不抛异常、不注册能力、不装载**，仅置 status='missing-deps'。
+ * @param {object} manifest 插件清单
+ * @returns {{ok: boolean, error?: string, missing: string[], installHint: string}}
+ */
+function probeOptionalDeps(manifest) {
+  const declared = (manifest && manifest.optionalDependencies) || {};
+  const missing = [];
+  for (const pkg of Object.keys(declared)) {
+    if (!OPTIONAL_WHITELIST.has(pkg)) {
+      return {
+        ok: false,
+        error: `未允许的可选依赖：${pkg}（可选依赖白名单见 src/host-api/contract.js）`,
+        missing: [pkg],
+        installHint: '',
+      };
+    }
+    if (!canResolve(pkg)) missing.push(pkg);
+  }
+
+  // 特殊约束：声明 nsfwjs 时必须至少有一个 TF.js 后端
+  if (Object.prototype.hasOwnProperty.call(declared, 'nsfwjs') && !missing.includes('nsfwjs')) {
+    const candidates = OPTIONAL_ANY_OF.nsfwjs || [];
+    const hasBackend = candidates.some((pkg) => canResolve(pkg));
+    if (!hasBackend) missing.push(candidates.map((p) => p).join('（或）'));
+  }
+
+  if (missing.length > 0) {
+    const installHint = buildInstallHint(declared, missing);
+    return { ok: false, missing, installHint };
+  }
+  return { ok: true, missing: [], installHint: '' };
+}
+
+/**
+ * 生成可选依赖缺失时的安装指引。
+ * @param {object} declared manifest.optionalDependencies
+ * @param {string[]} missing 缺失项
+ * @returns {string} 安装命令
+ */
+function buildInstallHint(declared, missing) {
+  const pkgs = Object.keys(declared || {});
+  const needed = pkgs.filter((p) => !missing.some((m) => m === p || m.startsWith(p)));
+  const list = needed.length > 0 ? needed : pkgs;
+  if (list.length === 0) return '';
+  return `npm i ${list.join(' ')}`;
+}
+
+/**
+ * 节点角色分类器（架构 §4.5，解决坑 ②）。
+ * @param {object} manifest 插件清单
+ * @returns {'service'|'contribute'|'finalize'|'task'} 分类
+ */
+function classifyPlugin(manifest) {
+  const explicit = manifest && manifest.contributes && manifest.contributes.flowRole;
+  if (explicit === 'task') return 'task';
+  const caps = (manifest && manifest.contributes && manifest.contributes.capabilities) || [];
+  if (caps.some((c) => /\.verdict$/.test(c.id))) return 'service';
+  if (caps.some((c) => c.id === 'image.tag')) return 'contribute';
+  if (caps.some((c) => c.id === 'image.linkage')) return 'finalize';
+  return 'task';
+}
+
+/**
+ * 由插件 manifest 生成拓扑节点描述符（供 flow/registry 注册）。
+ * 优先使用 manifest.contributes.nodes 显式声明；缺失时按能力合成。
+ * task 型插件**直接返回空**（注册表层排除，杜绝幽灵节点）。
+ * @param {object} meta 插件元数据
+ * @returns {{nodes: Array<object>, finalizers: Array<object>, role: string}}
+ */
+function buildPluginNodes(meta) {
+  const manifest = meta.manifest || {};
+  const contributes = manifest.contributes || {};
+  const role = classifyPlugin(manifest);
+  if (role === 'task') return { nodes: [], finalizers: [], role };
+
+  const caps = Array.isArray(contributes.capabilities) ? contributes.capabilities : [];
+  const capIds = new Set(caps.map((c) => c.id));
+  const declaredNodes = Array.isArray(contributes.nodes) ? contributes.nodes : [];
+  const out = [];
+
+  // 显式声明优先
+  for (const node of declaredNodes) {
+    const normalized = {
+      ...node,
+      ref: node.ref || `plugin.${meta.id}.${node.modality ? node.modality[0] : 'node'}`,
+      kind: 'plugin',
+      owner: meta.id,
+      role: contract.normalizeRole(node.role || (capIds.has('image.tag') ? 'contribute' : 'service')),
+      ready: true,
+      notReadyReason: '',
+      capability: node.capability || (capIds.has('text.verdict') ? 'text.verdict' : capIds.has('image.verdict') ? 'image.verdict' : 'image.tag'),
+      mode: node.mode || 'call',
+      modality: Array.isArray(node.modality) ? node.modality : ['image'],
+    };
+    out.push(normalized);
+  }
+
+  // 按能力合成（无显式声明时）
+  if (out.length === 0) {
+    if (capIds.has('text.verdict')) {
+      out.push({
+        ref: `plugin.${meta.id}.text`, kind: 'plugin', owner: meta.id, title: meta.name || meta.id,
+        modality: ['text'], role: 'service', defaultCombine: 'branch', combineEditable: false,
+        canParallel: true, multiInstance: true, capability: 'text.verdict', mode: 'call',
+        params: [], failurePolicyOptions: ['inherit', 'block', 'review'], defaultTimeoutMs: 15000,
+        costHint: 'paid-api',
+      });
+    }
+    if (capIds.has('image.verdict')) {
+      out.push({
+        ref: `plugin.${meta.id}.image`, kind: 'plugin', owner: meta.id, title: meta.name || meta.id,
+        modality: ['image'], role: 'service', defaultCombine: 'branch', combineEditable: false,
+        canParallel: true, multiInstance: true, capability: 'image.verdict', mode: 'call',
+        params: [], failurePolicyOptions: ['inherit', 'block', 'review'], defaultTimeoutMs: 15000,
+        costHint: 'paid-api',
+      });
+    }
+    if (capIds.has('image.tag')) {
+      out.push({
+        ref: `plugin.${meta.id}.tag`, kind: 'plugin', owner: meta.id, title: meta.name || meta.id,
+        modality: ['image'], role: 'contribute', defaultCombine: 'branch', combineEditable: false,
+        canParallel: false, multiInstance: false, capability: 'image.tag', mode: 'collect',
+        params: [], failurePolicyOptions: ['inherit', 'block', 'review'], defaultTimeoutMs: 15000,
+        costHint: 'free',
+      });
+    }
+  }
+
+  const finalizers = [];
+  if (capIds.has('image.linkage')) {
+    finalizers.push({
+      ref: `plugin.${meta.id}.linkage`, kind: 'plugin', owner: meta.id, role: 'finalize',
+      title: `${meta.name || meta.id} · 终裁联动`, modality: ['image'],
+      capability: 'image.linkage', mode: 'first', enabled: true,
+    });
+  }
+
+  return { nodes: out, finalizers, role };
+}
 
 /** id → PluginMeta（内存中的插件清单） */
 const _metas = new Map();
@@ -212,7 +374,7 @@ function staticScan(dir) {
         const pkg = m[1];
         if (pkg.startsWith('.') || pkg.startsWith('/') || path.isAbsolute(pkg)) continue;
         const top = pkg.startsWith('@') ? pkg.split('/').slice(0, 2).join('/') : pkg.split('/')[0];
-        if (!DEPENDENCY_WHITELIST.has(top) && !top.startsWith('node:')) {
+        if (!DEPENDENCY_WHITELIST.has(top) && !OPTIONAL_WHITELIST.has(top) && !top.startsWith('node:')) {
           risks.push({ file: relPath, kind: '未授权依赖', detail: `require('${pkg}')` });
         }
       }
@@ -276,6 +438,16 @@ function validateManifest(manifest, dir, existingIds = new Set()) {
   for (const dep of Object.keys(deps)) {
     if (!DEPENDENCY_WHITELIST.has(dep)) {
       errors.push(`插件声明了未允许的依赖：${dep}（本项目禁止新增 npm 包）`);
+    }
+  }
+
+  // ④-1 可选依赖白名单（v1.1）
+  const optionalDeps = manifest.optionalDependencies || {};
+  if (optionalDeps && typeof optionalDeps === 'object') {
+    for (const dep of Object.keys(optionalDeps)) {
+      if (!OPTIONAL_WHITELIST.has(dep)) {
+        errors.push(`插件声明了未允许的可选依赖：${dep}（可选依赖白名单见 src/host-api/contract.js）`);
+      }
     }
   }
 
@@ -394,6 +566,9 @@ function scanPlugins() {
     }
     const id = manifest.id;
     const saved = state[id] || {};
+    // ★ 可选依赖探测：缺失只标记，不阻断扫描（装载时再决定 missing-deps）
+    const probe = probeOptionalDeps(manifest);
+    const flowRole = classifyPlugin(manifest);
     // ★ 内置插件默认启用（保持与 v1.0.0「启动即加载 wd14」的行为一致）；
     //   但声明 defaultEnabled:false 的内置插件（如 batch-image-suite）保持关闭，
     //   避免未经用户确认就接管现有 /api/batch/* 行为（平滑迁移原则）。
@@ -413,6 +588,10 @@ function scanPlugins() {
       permissions: manifest.permissions || [],
       hostApi: manifest.hostApi || contract.HOST_API_VERSION,
       capabilities: capabilitiesOf(manifest),
+      optionalDependencies: manifest.optionalDependencies || {},
+      missingDeps: probe.ok ? [] : probe.missing,
+      installHint: probe.installHint || '',
+      flowRole,
       source: saved.source || manifest.source || { type: 'builtin' },
       enabled: saved.enabled === undefined ? defaultEnabled : saved.enabled === true,
       status: 'installed',
@@ -487,13 +666,114 @@ function loadDef(id, clearCache = false) {
 // ─── 生命周期 ───
 
 /**
- * 启用插件：清缓存 → 装载 → 注册 manifest 声明的视图。
+ * 把插件节点/终裁器注册进 flow/registry（注册表维护 owner → ref 映射，便于禁用时摘除）。
+ * @param {object} meta 插件元数据
+ * @returns {{nodes: Array<object>, finalizers: Array<object>, role: string}} 注册内容
+ */
+function registerPluginNodes(meta) {
+  flowRegistry.unregisterOwner(meta.id);
+  const built = buildPluginNodes(meta);
+  if (built.nodes.length > 0) flowRegistry.registerPluginNodes(meta.id, built.nodes, built.finalizers);
+  else if (built.finalizers.length > 0) flowRegistry.registerPluginNodes(meta.id, [], built.finalizers);
+  return built;
+}
+
+/**
+ * 依据 manifest 节点声明的 `readinessRpc` 异步探测插件就绪度，并写入 flow/registry。
+ *
+ * 目的（架构 §8.2）：把「已装载但未配置」的插件节点从 `failed`（fail-closed，整段拦截）
+ * 纠正为 `skipped`（合法降级），避免未配 AccessKey 就把整条链路拦死。
+ * 探测失败时**保持默认就绪**，不影响装载与主链路。
+ *
+ * @param {object} meta 插件元数据
+ * @param {{nodes: Array<object>, finalizers: Array<object>}} [built] 已注册内容
+ * @returns {Promise<boolean>} 是否成功写入探测值
+ */
+async function refreshPluginReadiness(meta, built) {
+  const declared = (meta.manifest && meta.manifest.contributes && meta.manifest.contributes.nodes) || [];
+  const rpc = declared.map((n) => n && n.readinessRpc).find(Boolean);
+  if (!rpc) return false;
+
+  const refs = [];
+  if (built) {
+    for (const n of built.nodes || []) if (n && n.ref) refs.push(n.ref);
+    for (const f of built.finalizers || []) if (f && f.ref) refs.push(f.ref);
+  }
+  if (refs.length === 0) return false;
+
+  try {
+    const host = require('./plugin-host');
+    const res = await host.dispatchRpc(meta.id, rpc, {});
+    if (!res || res.ok !== true || !res.result || typeof res.result !== 'object') return false;
+    const payload = res.result;
+    const topLevel = {
+      ready: payload.ready === true,
+      reason: payload.notReadyReason || '',
+      installHint: payload.installHint || '',
+    };
+    // ★ 逐节点优先：插件可返回 nodes:[{ref, modality, ready, notReadyReason?, installHint?}]，
+    //   用于「同一插件不同模态就绪度不同」（如 aliyun 文本开/图片关）——按 ref 查一次，
+    //   查不到再回落到顶层值。这样「模态被关闭」的节点才能正确走 skipped 而非 failed。
+    const perNode = new Map();
+    for (const entry of Array.isArray(payload.nodes) ? payload.nodes : []) {
+      if (entry && entry.ref) {
+        const notReady = entry.ready !== true;
+        perNode.set(entry.ref, {
+          ready: entry.ready === true,
+          reason: entry.notReadyReason !== undefined
+            ? entry.notReadyReason
+            : (notReady ? (topLevel.reason || 'not-ready') : ''),
+          installHint: entry.installHint !== undefined ? entry.installHint : topLevel.installHint,
+        });
+      }
+    }
+    for (const ref of refs) flowRegistry.setReadiness(ref, perNode.get(ref) || topLevel);
+    return true;
+  } catch (err) {
+    logInfo('plugin-scanner', `插件 ${meta.id} 就绪度探测跳过（${err && err.message}）`);
+    return false;
+  }
+}
+
+/**
+ * 刷新全部已启用插件的就绪度（供 /api/flow/capabilities 拉取前调用）。
+ * @returns {Promise<number>} 成功刷新的插件数
+ */
+async function refreshAllReadiness() {
+  let count = 0;
+  for (const meta of _metas.values()) {
+    if (meta.status !== 'active') continue;
+    const built = {
+      nodes: (meta.nodeRefs || []).filter((r) => !r.includes('.linkage')).map((r) => ({ ref: r })),
+      finalizers: (meta.nodeRefs || []).filter((r) => r.includes('.linkage')).map((r) => ({ ref: r })),
+    };
+    // eslint-disable-next-line no-await-in-loop
+    if (await refreshPluginReadiness(meta, built)) count += 1;
+  }
+  return count;
+}
+
+/**
+ * 启用插件：探测可选依赖 → 清缓存 → 装载 → 注册能力与拓扑节点。
+ * ★ 可选依赖缺失时进入 `missing-deps`，不抛异常、不注册能力、不装载（架构 §8.2）。
  * @param {string} id 插件 id
- * @returns {Promise<{ok: boolean, status: string, error?: string}>}
+ * @returns {Promise<{ok: boolean, status: string, error?: string, missing?: string[], installHint?: string}>}
  */
 async function enable(id) {
   const meta = _metas.get(id);
   if (!meta) return { ok: false, status: 'error', error: `插件 ${id} 不存在` };
+
+  // ★ v1.1：可选依赖探测（缺失 → missing-deps，核心与其它插件完全不受影响）
+  const probe = probeOptionalDeps(meta.manifest || {});
+  if (!probe.ok) {
+    meta.status = 'missing-deps';
+    meta.missingDeps = probe.missing;
+    meta.installHint = probe.installHint || meta.installHint || '';
+    meta.error = `缺少可选依赖：${probe.missing.join('、')}`;
+    logInfo('plugin-scanner', `插件 ${id} 可选依赖缺失，已跳过装载（${meta.error}；安装：${meta.installHint || 'n/a'}）`);
+    return { ok: false, status: 'missing-deps', missing: probe.missing, installHint: meta.installHint };
+  }
+
   try {
     meta.status = 'loading';
     const def = loadDef(id, true);
@@ -522,6 +802,14 @@ async function enable(id) {
       meta.error = `能力注册失败：${capRes.errors.join('；')}`;
       logError('plugin-scanner', `插件 ${id} 能力注册失败: ${capRes.errors.join('；')}`);
     }
+    // ★ v1.1：注册拓扑节点/终裁器描述符（task 型插件在此被排除，杜绝幽灵节点）
+    const nodeReg = registerPluginNodes(meta);
+    meta.nodeRefs = nodeReg.nodes.map((n) => n.ref).concat(nodeReg.finalizers.map((f) => f.ref));
+    // ★ v2.2.0：按 manifest.readinessRpc 探测就绪度 → 未就绪节点走 skipped 而非 failed
+    await refreshPluginReadiness(meta, nodeReg);
+    if (nodeReg.role === 'task') {
+      logInfo('plugin-scanner', `插件 ${id} 判定为 task 型，已从画布节点面板排除`);
+    }
     patchState(id, { enabled: true, version: meta.version });
     logInfo('plugin-scanner', `插件已启用: ${id}`);
     return { ok: true, status: 'loaded' };
@@ -543,9 +831,12 @@ async function disable(id) {
   const res = await bridge.unloadPlugin(id);
   // 摘除能力提供者：核心从此查不到该能力，等同于「无插件」
   broker.unregisterPlugin(id);
+  // ★ v1.1：摘除拓扑节点/终裁器描述符
+  flowRegistry.unregisterOwner(id);
   if (meta) {
     meta.status = 'installed';
     meta.error = null;
+    meta.nodeRefs = [];
   }
   patchState(id, { enabled: false });
   logInfo('plugin-scanner', `插件已禁用: ${id}`);
@@ -580,6 +871,7 @@ async function uninstall(id) {
     const target = path.join(TRASH_DIR, `${id}-${ts}`);
     fs.renameSync(meta.dir, target);
     broker.unregisterPlugin(id);
+    flowRegistry.unregisterOwner(id);
     _metas.delete(id);
     const state = loadState();
     delete state[id];
@@ -882,7 +1174,8 @@ function describe() {
   for (const meta of _metas.values()) {
     const entry = bridge.getPlugin(meta.id);
     let status = 'disabled';
-    if (meta.status === 'error') status = 'error';
+    if (meta.status === 'missing-deps') status = 'missing-deps';
+    else if (meta.status === 'error') status = 'error';
     else if (entry && (entry.status === 'loaded' || entry.status === 'loading')) status = 'loaded';
     out.push({
       id: meta.id,
@@ -896,6 +1189,12 @@ function describe() {
       permissions: meta.permissions,
       provides: meta.provides,
       injects: meta.injects,
+      // ★ v1.1：可选依赖就绪度（UI 置灰 + 安装指引）
+      optionalDependencies: meta.optionalDependencies || {},
+      missingDeps: meta.missingDeps || [],
+      installHint: meta.installHint || '',
+      flowRole: meta.flowRole || classifyPlugin(meta.manifest || {}),
+      nodeRefs: meta.nodeRefs || [],
       risks: meta.risks || [],
       installedAt: meta.installedAt,
       updatedAt: meta.updatedAt,
@@ -954,4 +1253,12 @@ module.exports = {
   patchState,
   getState,
   compareVersion,
+  canResolve,
+  probeOptionalDeps,
+  buildInstallHint,
+  classifyPlugin,
+  buildPluginNodes,
+  registerPluginNodes,
+  refreshPluginReadiness,
+  refreshAllReadiness,
 };

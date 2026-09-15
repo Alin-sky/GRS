@@ -1,15 +1,21 @@
 /**
  * 内核事件注册表（src/host-api/event-registry.js）
  *
- * ★ 事件名与 payload 形状属于契约，不允许插件层或核心层硬编码字面量（修 C02 隐式契约）。
+ * ★ 事件名与 payload 形状属于契约，不允许插件层或核心层硬编码字面量。
  *   核心发事件、插件订事件，双方都从这里取名字。
  *
- * 设计依据：docs/architecture-2026-09-14.md §3.4
+ * 设计依据：docs/architecture-2026-09-14.md §3.4；GRS v2.2.0 架构 §8.3
  *
  * | 事件                        | 模式    | payload                              | 返回值 schema                |
  * |-----------------------------|---------|--------------------------------------|------------------------------|
  * | moderation:image:tag        | collect | (imageBase64)                        | ModerationTagContribution    |
  * | moderation:image:linkage    | first   | (result: Verdict, contributions[])   | ModerationVerdict            |
+ * | moderation:verdict:text     | call    | (request)                            | ModerationVerdict            |
+ * | moderation:verdict:image    | call    | (request)                            | ModerationVerdict            |
+ *
+ * ★ 关于「事件名按 ref 派生」的偏离说明：事件表必须**静态**才能被
+ *   scripts/lint-plugin-boundary.js 静态校验，而 `ref` 是插件自定义的动态值。
+ *   故采用「静态事件（按模态）+ 载荷携带 ref」：插件在同一事件处理器内按 request.ref 分发。
  */
 const { CAPABILITIES, OUTPUT_SCHEMAS } = require('./contract');
 
@@ -17,6 +23,8 @@ const { CAPABILITIES, OUTPUT_SCHEMAS } = require('./contract');
 const MODE_COLLECT = 'collect';
 /** 短路模式：按 order 顺序执行，首个非空返回值即为结果 */
 const MODE_FIRST = 'first';
+/** 点对点调用模式：只调用 owner 指定的处理器（按 owner 定位唯一提供者） */
+const MODE_CALL = 'call';
 
 /** 事件名常量（唯一来源） */
 const EVENTS = Object.freeze({
@@ -24,6 +32,10 @@ const EVENTS = Object.freeze({
   IMAGE_TAG: 'moderation:image:tag',
   /** 图片审核联动判定（首个非空返回即最终判定） */
   IMAGE_LINKAGE: 'moderation:image:linkage',
+  /** 文本判定（点对点调用） */
+  VERDICT_TEXT: 'moderation:verdict:text',
+  /** 图像判定（点对点调用） */
+  VERDICT_IMAGE: 'moderation:verdict:image',
 });
 
 /**
@@ -42,6 +54,18 @@ const REGISTRY = Object.freeze({
     payload: ['result', 'contributions'],
     outputSchema: OUTPUT_SCHEMAS.MODERATION_VERDICT,
     capability: CAPABILITIES.IMAGE_LINKAGE,
+  },
+  [EVENTS.VERDICT_TEXT]: {
+    mode: MODE_CALL,
+    payload: ['request'],
+    outputSchema: OUTPUT_SCHEMAS.MODERATION_VERDICT,
+    capability: CAPABILITIES.TEXT_VERDICT,
+  },
+  [EVENTS.VERDICT_IMAGE]: {
+    mode: MODE_CALL,
+    payload: ['request'],
+    outputSchema: OUTPUT_SCHEMAS.MODERATION_VERDICT,
+    capability: CAPABILITIES.IMAGE_VERDICT,
   },
 });
 
@@ -69,7 +93,7 @@ function isKnownEvent(event) {
 /**
  * 取事件声明的模式（未知事件返回 null）。
  * @param {string} event 事件名
- * @returns {'collect'|'first'|null}
+ * @returns {'collect'|'first'|'call'|null}
  */
 function modeOf(event) {
   const def = getEvent(event);
@@ -128,6 +152,7 @@ function validateCapability(capability) {
 module.exports = {
   MODE_COLLECT,
   MODE_FIRST,
+  MODE_CALL,
   EVENTS,
   REGISTRY,
   EVENT_NAMES,

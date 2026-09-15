@@ -31,6 +31,15 @@ const DEPENDENCY_WHITELIST = new Set([
   ...builtinModules,
 ]);
 
+/**
+ * 可选依赖白名单（v2.2.0，架构 §8.2）。
+ * 这些包**不进 package.json 任何依赖区**（除 @alicloud/green20220302 已降级为 optionalDependencies），
+ * 插件如需使用必须在 manifest.optionalDependencies 声明，且**只能惰性 require**（不得在模块顶层）。
+ */
+const OPTIONAL_DEPENDENCY_WHITELIST = new Set([
+  'nsfwjs', '@tensorflow/tfjs-node', '@tensorflow/tfjs', '@alicloud/green20220302',
+]);
+
 /** 核心模块（这些文件属于核心，禁止反向依赖插件层） */
 const CORE_MODULES = Object.freeze([
   'server.js', 'moderator.js', 'comparator.js', 'batch-scan.js', 'precheck.js',
@@ -46,10 +55,10 @@ const CORE_ALLOWED_PLUGIN_LAYER = new Set(['./plugin-runtime', './capability-bro
 const PLUGIN_LAYER_RE = /^\.\/(plugin-[\w-]+|cordis-[\w-]+|host-services|plugin-system)$/;
 
 /**
- * 已知待迁移基线：这些违规在阶段 B 里由 moderator.js 的负责人处理，
- * 本 lint 只报告不阻塞（moderator.js 归 T02 改造，禁止并发修改）。
+ * 已知待迁移基线：v2.2.0 已完成 moderator.js 的边界修复（移除 require('./plugin-registry')），
+ * 故此处清空；若再出现核心 → 插件层反向依赖，lint 将直接失败。
  */
-const KNOWN_PENDING = Object.freeze(['src/moderator.js']);
+const KNOWN_PENDING = Object.freeze([]);
 
 /** 规则说明（供报告输出） */
 const RULES = Object.freeze({
@@ -58,6 +67,7 @@ const RULES = Object.freeze({
   'plugin-direct-cordis': "插件代码直接 require('cordis')（应只通过注入的 ctx）",
   'plugin-host-app': '插件代码使用 host.app（契约 v1.0 已移除 host:app）',
   'plugin-unwhitelisted-dep': '插件代码 require 了白名单外的 npm 包',
+  'plugin-eager-optional-require': '可选依赖在模块顶层 eager require（必须惰性 require，否则依赖缺失会崩）',
   'core-reverse-dependency': '核心模块反向 require 插件层（核心只允许依赖 capability-broker / plugin-runtime）',
 });
 
@@ -113,8 +123,18 @@ function checkPluginDir(dir) {
           violations.push({ rule: 'plugin-direct-cordis', file: file.rel, line: i + 1, detail: `require('${spec}')` });
           continue;
         }
-        if (!DEPENDENCY_WHITELIST.has(top) && !top.startsWith('node:')) {
+        if (!DEPENDENCY_WHITELIST.has(top) && !OPTIONAL_DEPENDENCY_WHITELIST.has(top) && !top.startsWith('node:')) {
           violations.push({ rule: 'plugin-unwhitelisted-dep', file: file.rel, line: i + 1, detail: `require('${spec}')` });
+          continue;
+        }
+        // ★ v2.2.0：可选依赖不得在模块顶层 eager require（必须惰性 + try/catch）
+        if (OPTIONAL_DEPENDENCY_WHITELIST.has(top) && /^(?:const|let|var)?\s*[\w{[\],\s}]*=\s*require\s*\(/.test(line)) {
+          violations.push({
+            rule: 'plugin-eager-optional-require',
+            file: file.rel,
+            line: i + 1,
+            detail: `顶层 require('${spec}')（应改为惰性 require，并用 try/catch 兜底）`,
+          });
         }
       }
       // ② 非字面量 require 且文本里出现核心目录
@@ -243,6 +263,7 @@ module.exports = {
   PROJECT_ROOT,
   PLUGINS_DIR,
   DEPENDENCY_WHITELIST,
+  OPTIONAL_DEPENDENCY_WHITELIST,
   CORE_MODULES,
   CORE_ALLOWED_PLUGIN_LAYER,
   KNOWN_PENDING,

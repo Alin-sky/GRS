@@ -195,6 +195,47 @@ function wd14Tagger(ctx) {
     scoreScale: config.scoreScale,
     generalThreshold: config.generalThreshold,
   }));
+
+  // ★ 就绪度自报（供宿主按 manifest 节点声明的 readinessRpc 取用；不发起网络探测，只报已知状态）
+  //   - disabled        ：插件配置中关闭了标签预筛
+  //   - circuit-open    ：联动熔断已打开（连续失败达阈值，等待冷却）
+  //   - service-unknown ：正常（是否可达由调用时的实际请求决定）
+  ctx.rpc('wd14.status', () => {
+    const circuitOpen = linkage.isCircuitOpen();
+    const enabled = config.enabled !== false;
+    const reason = !enabled ? 'disabled' : (circuitOpen ? 'circuit-open' : '');
+    return {
+      ready: enabled && !circuitOpen,
+      notReadyReason: reason,
+      notReadyMessage: reason === 'disabled'
+        ? '插件配置中已关闭标签预筛'
+        : reason === 'circuit-open'
+          ? '联动熔断已打开，等待冷却后自动恢复'
+          : '',
+      installHint: '',
+      configHint: '需要本机 WD14 标签服务可达；服务地址与联动策略在「插件管理 → wd14-tagger」配置',
+      serviceHost: config.host,
+      linkageMode: config['linkage.mode'],
+      stats: linkage.stats,
+      refs: {
+        tag: 'plugin.wd14-tagger.tag',
+        linkage: 'plugin.wd14-tagger.linkage',
+      },
+      // 逐节点就绪度（宿主按 ref 精确置灰；打标节点与终裁器同源状态）
+      nodes: [
+        {
+          ref: 'plugin.wd14-tagger.tag',
+          modality: 'image',
+          ready: enabled && !circuitOpen,
+          notReadyReason: reason,
+          notReadyMessage: reason === 'disabled'
+            ? '插件配置中已关闭标签预筛'
+            : reason === 'circuit-open' ? '联动熔断已打开，等待冷却后自动恢复' : '',
+          installHint: '',
+        },
+      ],
+    };
+  });
 }
 
 Object.defineProperty(wd14Tagger, 'name', { value: 'wd14-tagger', configurable: true });

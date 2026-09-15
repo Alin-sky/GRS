@@ -14,7 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const { logInfo, logWarn, logError } = require('./logger');
-const { isDeniedConfigKey, CONFIG_REDACTED } = require('./host-api/contract');
+const { isDeniedConfigKey, CONFIG_REDACTED, secretGrantsOf } = require('./host-api/contract');
 
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.tif', '.avif']);
 
@@ -226,6 +226,90 @@ function sanitizeConfig(config) {
 }
 
 /**
+ * 按 'a.b.c' 路径读取原始配置值。
+ * @param {object} config 原始配置
+ * @param {string} configPath 路径
+ * @returns {*} 值或 undefined
+ */
+function pickConfigPath(config, configPath) {
+  const keys = String(configPath || '').split('.');
+  let cursor = config;
+  for (const key of keys) {
+    if (cursor === null || cursor === undefined || typeof cursor !== 'object') return undefined;
+    cursor = cursor[key];
+  }
+  return cursor;
+}
+
+/**
+ * 宿主 secrets 服务（方案 C，架构 §8.1）。
+ * ★ 密钥**不下发**给插件的 config 投影（CONFIG_DENY_KEYS 规则不变）；
+ *   只有 manifest 声明 `services.injects: ['secrets']` + `permissions: ['moderation:provide']`
+ *   且 id 命中 SECRET_GRANTS 白名单的插件，才能按白名单路径取到明文。
+ * @param {object} config 原始配置
+ * @returns {{get: Function, grantsOf: Function}} secrets 服务
+ */
+function createSecretsService(config = {}) {
+  const warned = new Set();
+  return {
+    /**
+     * 取某插件白名单内的密钥明文。
+     * @param {string} pluginId 插件 id
+     * @param {string} configPath 配置路径（如 contentSafety.accessKeyId）
+     * @returns {string|null} 明文或 null（未授权 / 未配置）
+     */
+    get(pluginId, configPath) {
+      const grants = secretGrantsOf(pluginId);
+      if (!grants.includes(configPath)) {
+        const tag = `${pluginId}:${configPath}`;
+        if (!warned.has(tag)) {
+          warned.add(tag);
+          logWarn('host-services', `插件 ${pluginId} 请求了白名单外的密钥字段 '${configPath}'，已拒绝`);
+        }
+        return null;
+      }
+      const value = pickConfigPath(config, configPath);
+      return value === undefined || value === null ? null : String(value);
+    },
+    /** 取某插件允许读取的密钥路径列表 */
+    grantsOf: secretGrantsOf,
+  };
+}
+
+/**
+ * 宿主 precheck 服务（F07 词库不出库）。
+ * ★ 只返回 { hit, category, level }，**绝不返回命中词原文，也不返回词表本身**。
+ * @returns {{match: Function}} precheck 服务
+ */
+function createPrecheckService() {
+  return {
+    /**
+     * 匹配文本是否命中敏感词（受控判定 API）。
+     * @param {string} text 待检测文本
+     * @returns {{hit: boolean, category: string, level: string}} 判定（不含原文）
+     */
+    match(text) {
+      try {
+        const { precheck } = require('./precheck');
+        const result = precheck(String(text || ''));
+        if (!result || !result.hasHit || !Array.isArray(result.hits) || result.hits.length === 0) {
+          return { hit: false, category: '', level: '' };
+        }
+        // 只取最高等级命中的分类与等级，绝不带出词条原文
+        const order = { safe: 0, low: 1, medium: 2, review: 3, high: 4, critical: 5 };
+        let best = result.hits[0];
+        for (const hit of result.hits) {
+          if ((order[hit.level] ?? 0) > (order[best.level] ?? 0)) best = hit;
+        }
+        return { hit: true, category: String(best.category || ''), level: String(best.level || 'medium') };
+      } catch {
+        return { hit: false, category: '', level: '' };
+      }
+    },
+  };
+}
+
+/**
  * 构建宿主能力集合。
  * @param {{config?: object, moderator?: object, sharp?: object, vision?: object, projectRoot?: string}} deps 依赖
  * @returns {object} 宿主服务对象
@@ -247,6 +331,10 @@ function createHostServices(deps = {}) {
     projectRoot,
     logger: loggerService,
     fs: { statDir, listDir, roots, isImagePath, isInsideRoot },
+    /** 受控密钥下发（白名单） */
+    secrets: createSecretsService(config),
+    /** 受控词库判定（不出库） */
+    precheck: createPrecheckService(),
     /** 便捷方法：判断路径是否在工程目录内（asset 白名单用） */
     isInsideProject(target) {
       return isInsideRoot(target, projectRoot);
@@ -256,6 +344,8 @@ function createHostServices(deps = {}) {
 
 module.exports = {
   createHostServices,
+  createSecretsService,
+  createPrecheckService,
   sanitizeConfig,
   deepFreeze,
   loggerService,
@@ -264,5 +354,6 @@ module.exports = {
   roots,
   isImagePath,
   isInsideRoot,
+  pickConfigPath,
   IMAGE_EXTS,
 };

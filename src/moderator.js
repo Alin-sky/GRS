@@ -6,10 +6,23 @@ const { logModeration, logError, logInfo, logWarn } = require('./logger');
 const crypto = require('crypto');
 const { precheck, buildPrecheckHint } = require('./precheck');
 const { saveAuditRecord } = require('./audit-store');
-const pluginRegistry = require('./plugin-registry');
+// ★ v2.2.0：核心不再直接依赖插件注册中心（顺带修复历史越界违规 F-8）；
+//   插件标签/联动一律经能力中介（capability-broker）触达。
+const capabilityBroker = require('./capability-broker');
 const fence = require('./security/prompt-fence');
 const { validateVerdict } = require('./security/output-schema');
 const injectionAudit = require('./security/injection-audit');
+// ★ R0：风险序唯一来源（src/flow/risk.js）。
+const { RISK_ORDER, CONTENT_RISK_LEVELS } = require('./flow/risk');
+const flowModule = require('./flow');
+const {
+  FAILURE_TYPE,
+  extractJSON,
+  sanitizeRawSnippet,
+  matchesResultSchema,
+  normalizeVerdict,
+  buildTextPrompt,
+} = require('./flow/nodes/shared');
 
 const config = loadConfig();
 
@@ -33,15 +46,8 @@ function validCategoryIds() {
 // ─── 失败-关闭（fail-closed）相关常量 ───
 // 当「已配置 AI 通道但未取得有效判定」时，绝不能沿用旧的 pass_log 放行语义：
 // 攻击者只要在待审核内容里诱导模型输出自然语言或畸形 JSON，就能绕过审核。
-const FAILURE_TYPE = {
-  TIMEOUT: 'timeout',   // 请求超时
-  NETWORK: 'network',   // 网络/连接类错误
-  HTTP: 'http',         // 服务端返回错误码
-  EMPTY: 'empty',       // 模型返回空内容
-  PARSE: 'parse',       // 返回了内容但无法解析为 JSON
-  SCHEMA: 'schema',     // 解析成功但不符合审核结果 schema（缺少 risk_level 等）
-  UNKNOWN: 'unknown',
-};
+// ★ FAILURE_TYPE 与 extractJSON / sanitizeRawSnippet / matchesResultSchema / normalizeVerdict
+//   已统一到 src/flow/nodes/shared.js（旧引擎与新执行器共用同一实现，避免漂移）。
 
 // 动作严重程度（含 review：比"记录放行"更严，比"拦截"稍宽）
 const ACTION_ORDER = { pass: 0, pass_log: 1, review: 2, block: 3, block_alert: 4 };
@@ -62,49 +68,7 @@ function newRequestId() {
  * @param {string} raw 模型原始输出
  * @returns {string} 脱敏后的片段
  */
-function sanitizeRawSnippet(raw) {
-  if (raw === undefined || raw === null) return '';
-  return String(raw)
-    .replace(/[\r\n\t]+/g, ' ')
-    .replace(/\p{Cc}+/gu, ' ')   // 去掉其余控制字符，避免污染单行日志
-    .trim()
-    .substring(0, 100);
-}
-
-/**
- * 判断解析结果是否符合审核 schema：必须给出可识别的 risk_level。
- * @param {object|null} parsed extractJSON 的结果
- * @param {string[]} validLevels 合法风险等级
- * @returns {boolean} 是否符合 schema
- */
-function matchesResultSchema(parsed, validLevels) {
-  if (!parsed || typeof parsed !== 'object') return false;
-  return validLevels.includes(parsed.risk_level);
-}
-
-/**
- * 用 OutputValidator 校验并规范化一条模型判定（架构 §2.3）。
- *
- * 与旧的 normalizeResult 的关键差别：**失败一律返回 {ok:false} 与统一失败码**，
- * 绝不再把「能解析但没有 risk_level」「缺少哨兵字段」等情形降级成 low/pass。
- *
- * @param {unknown} parsed extractJSON 的结果
- * @param {{nonce?: string, source?: 'model'|'plugin'|'contentSafety'}} [ctx] 校验上下文
- * @returns {{ok: true, value: object, notes: string[]}
- *          | {ok: false, code: string, detail: string, notes: string[]}} 校验结果
- */
-function normalizeVerdict(parsed, ctx = {}) {
-  const res = validateVerdict(parsed, {
-    categories: validCategoryIds(),
-    nonce: ctx.nonce || '',
-    requirePolicyVersion: crossCheckConfig().requirePolicyCanary,
-    source: ctx.source || 'model',
-  });
-  if (!res.ok) {
-    return { ok: false, code: res.code, detail: res.detail, notes: res.notes || [] };
-  }
-  return { ok: true, value: { ...res.value }, notes: res.notes || [] };
-}
+// ★ sanitizeRawSnippet 已统一到 src/flow/nodes/shared.js（见文件顶部 import）。
 
 /**
  * 根据配置与严格程度决定 fail-closed 的判定结论。
@@ -253,63 +217,11 @@ function warnDegradedModeOnce() {
  * 模型可能输出  bitmask思考过程bitmask  包裹的内容，也可能直接输出 JSON
  * 也可能输出 ```json ... ``` 包裹的内容
  */
-function extractJSON(text) {
-  if (!text) return null;
-
-  let cleaned = text.trim();
-
-  // 去除 thinking 标签内容（qwen3 等模型的思考过程）
-  // 匹配 <think>...</think> 或 <thinking>...</thinking>
-  cleaned = cleaned.replace(/<(think|thinking)>[\s\S]*?<\/\1>/gi, '').trim();
-
-  // 如果去除后为空（think 标签不完整/无闭标签），恢复原始文本
-  if (!cleaned) cleaned = text.trim();
-
-  // 再次去除残留的 think 标签（只有开或闭标签的情况）
-  cleaned = cleaned.replace(/^<\/?(think|thinking)>/gi, '').trim();
-
-  // 尝试直接解析
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    // 继续
-  }
-
-  // 尝试提取 ```json ... ``` 中的内容
-  const jsonBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonBlockMatch) {
-    try {
-      return JSON.parse(jsonBlockMatch[1].trim());
-    } catch {
-      // 继续
-    }
-  }
-
-  // 从后往前提取最后一个完整 JSON 对象
-  // 比"第一个{到最后一个}"更准确，避免 think 残留中的花括号干扰
-  let lastEnd = cleaned.lastIndexOf('}');
-  while (lastEnd !== -1) {
-    let depth = 0;
-    let start = -1;
-    for (let i = lastEnd; i >= 0; i--) {
-      if (cleaned[i] === '}') depth++;
-      else if (cleaned[i] === '{') {
-        depth--;
-        if (depth === 0) { start = i; break; }
-      }
-    }
-    if (start !== -1) {
-      try {
-        return JSON.parse(cleaned.substring(start, lastEnd + 1));
-      } catch {
-        // 继续找前一个 }
-      }
-    }
-    lastEnd = cleaned.lastIndexOf('}', lastEnd - 1);
-  }
-
-  return null;
-}
+/**
+ * 从模型回复中提取 JSON
+ * 模型可能输出 think 包裹的内容，也可能直接输出 JSON，或 ```json ... ``` 包裹的内容
+ * ★ 已统一到 src/flow/nodes/shared.js（见文件顶部 import）。
+ */
 
 /**
  * 校验和规范化审核结果（架构 §2.3）。
@@ -383,9 +295,8 @@ function evaluateThresholds(categoryScores, strictness = 'standard') {
   return { action: worstAction, risk_level: worstRisk, triggeredCategories: triggered };
 }
 
-const RISK_ORDER = { safe: 0, low: 1, medium: 2, review: 2.5, high: 3, critical: 4 };
-// 合法的内容风险等级（不含 review：review 表示「审核链路失效」，不来自模型判定）
-const CONTENT_RISK_LEVELS = ['safe', 'low', 'medium', 'high', 'critical'];
+// ★ R0：RISK_ORDER / CONTENT_RISK_LEVELS 已统一到 src/flow/risk.js（见文件顶部 import）。
+//   review 表示「审核链路失效」而非内容风险，故不在 CONTENT_RISK_LEVELS 中。
 
 /**
  * 将阿里云内容安全的建议合并到统一审核结果。
@@ -683,7 +594,13 @@ function buildCloudCost(usage, model, elapsedMs) {
  * @param {object} options - 选项 { strictness: 'relaxed'|'standard'|'strict' }
  * @returns {Promise<object>} 审核结果
  */
-async function moderateText(text, meta = {}, options = {}) {
+/**
+ * 文本审核（v2.1.0 旧引擎）—— `@deprecated`
+ *
+ * 逃生舱：仅当 `moderation.flows.enabled === false` 时由 `moderateText` 分发到此，
+ * 行为与 v2.1.0 **逐字段一致**。保留至 v2.3.0。
+ */
+async function legacyModerateText(text, meta = {}, options = {}) {
   const strictness = options.strictness || config.moderation.strictness || 'standard';
   const requestId = newRequestId();
   if (!text || !text.trim()) {
@@ -1361,7 +1278,12 @@ async function moderateText(text, meta = {}, options = {}) {
  * @param {object} meta - 元数据
  * @returns {Promise<object>} 审核结果
  */
-async function moderateImage(imageBase64, text = '', meta = {}) {
+/**
+ * 图片审核（v2.1.0 旧引擎）—— `@deprecated`
+ *
+ * 逃生舱：仅当 `moderation.flows.enabled === false` 时由 `moderateImage` 分发到此。
+ */
+async function legacyModerateImage(imageBase64, text = '', meta = {}) {
   const strictness = meta.strictness || config.moderation.strictness || 'standard';
   if (!imageBase64) {
     return {
@@ -1661,15 +1583,14 @@ async function moderateImage(imageBase64, text = '', meta = {}) {
  */
 async function applyPluginTags(result, imageBase64) {
   try {
-    const contributions = await pluginRegistry.collectImageTags(imageBase64);
+    const contributions = await capabilityBroker.collectImageTags(imageBase64);
     if (!contributions || contributions.length === 0) return result;
 
     // 记录视觉模型的原始判定（供 UI 展示判定来源）
     result.vl_level = result.risk_level;
     result.vl_reason = result.reason;
 
-    const bridge = pluginRegistry.getBridgeModule();
-    const resolved = await bridge.emitFirst('moderation:image:linkage', result, contributions);
+    const resolved = await capabilityBroker.resolveImageLinkage(result, contributions);
     if (resolved && typeof resolved === 'object' && resolved.risk_level) return resolved;
     return result;
   } catch (err) {
@@ -1852,7 +1773,8 @@ async function moderate(text = '', images = [], meta = {}) {
   }
 
   // 综合判定：取最高风险等级
-  const riskOrder = { safe: 0, low: 1, medium: 2, high: 3, critical: 4 };
+  // ★ R0：风险序唯一来源。
+  const riskOrder = RISK_ORDER;
   let maxRisk = 'safe';
   let allCategories = new Set();
   let minConfidence = 1.0;
@@ -1889,4 +1811,400 @@ async function moderate(text = '', images = [], meta = {}) {
   return combined;
 }
 
-module.exports = { moderateText, moderateImage, moderateImageLocal, moderate, healthCheck };
+// ═══════════════════════════════════════════
+// v2.2.0 编排层接入（DAG 执行器 + 逃生开关）
+// ═══════════════════════════════════════════
+
+/** 流程总开关（`moderation.flows.enabled`，默认 true；false 回退旧引擎）。 */
+function flowsEnabled() {
+  return flowModule.isEnabled(config);
+}
+
+/**
+ * 由节点轨迹 + 通道就绪度推导通道状态（对齐 v2.1.0 的 buildChannelStatus 语义）。
+ * @param {object} outcome 执行结果
+ * @param {'text'|'image'} modality 模态
+ * @param {boolean} csApplied 内容安全是否实际生效
+ * @returns {object} 通道状态
+ */
+function deriveChannelState(outcome, modality, csApplied) {
+  const caps = getCapabilities();
+  const traces = [...outcome.results.values()];
+  const stateOf = (trace, available) => {
+    if (!trace) return available ? CHANNEL_STATE.IDLE : CHANNEL_STATE.SKIPPED;
+    if (trace.status === 'ok') return CHANNEL_STATE.USED;
+    if (trace.status === 'failed') return CHANNEL_STATE.FAILED;
+    if (trace.status === 'skipped') return CHANNEL_STATE.SKIPPED;
+    return available ? CHANNEL_STATE.IDLE : CHANNEL_STATE.SKIPPED;
+  };
+  return {
+    precheck: modality === 'text' ? CHANNEL_STATE.USED : CHANNEL_STATE.IDLE,
+    local: stateOf(traces.find((t) => t.ref === 'builtin.localModel'), caps.local.available),
+    cloud: stateOf(traces.find((t) => t.ref === 'builtin.cloudModel'), caps.cloud.available),
+    contentSafety: csApplied ? CHANNEL_STATE.USED : CHANNEL_STATE.SKIPPED,
+  };
+}
+
+/**
+ * 把节点轨迹投影为兼容字段（local_result / cloud_result / dual_mode / double_checked / cached / cloud_cost）。
+ * @param {object} result 审核结果（原地修改）
+ * @param {object} outcome 执行结果
+ * @param {string} model 本地模型名
+ * @returns {object} 结果
+ */
+function projectCompat(result, outcome, model) {
+  const okNodes = outcome.nodeResults.filter((r) => r.status === 'ok');
+  const localNodes = okNodes.filter((r) => r.ref === 'builtin.localModel');
+  const cloudNodes = okNodes.filter((r) => r.ref === 'builtin.cloudModel');
+
+  if (localNodes.length > 0) {
+    const n = localNodes[0];
+    result.local_result = {
+      risk_level: n.verdict.risk_level,
+      categories: n.verdict.categories,
+      category_scores: n.verdict.category_scores,
+      confidence: n.verdict.confidence,
+      reason: n.verdict.reason,
+      elapsed_ms: n.elapsedMs,
+      model,
+    };
+  }
+
+  if (cloudNodes.length > 0) {
+    const n = cloudNodes[0];
+    const cloudMeta = n.cloud || {};
+    result.cloud_result = {
+      risk_level: n.verdict.risk_level,
+      categories: n.verdict.categories,
+      category_scores: n.verdict.category_scores,
+      confidence: n.verdict.confidence,
+      reason: n.verdict.reason,
+      elapsed_ms: n.elapsedMs,
+      model: cloudMeta.model || (config.qwenCloud && config.qwenCloud.model) || 'qwen-plus',
+    };
+    result.cloud_model = cloudMeta.model || (config.qwenCloud && config.qwenCloud.model) || 'qwen-plus';
+    result.cloud_fallback = cloudMeta.fallback === true;
+    if (cloudMeta.cached) result.cached = true;
+    result.cloud_cost = buildCloudCost(cloudMeta.usage || null, result.cloud_model, n.elapsedMs);
+  }
+
+  if (localNodes.length > 0 && cloudNodes.length > 0) {
+    result.dual_mode = true;
+    result.review_mode = true;
+    const wonBy = outcome.merge && outcome.merge.won_by ? outcome.merge.won_by : null;
+    const winnerNode = wonBy ? outcome.results.get(wonBy) : null;
+    if (winnerNode && winnerNode.ref === 'builtin.localModel') result.result_source = 'local';
+    else if (winnerNode && winnerNode.ref === 'builtin.cloudModel') result.result_source = 'cloud';
+    else result.result_source = 'merged';
+  } else if (cloudNodes.length > 0) {
+    result.result_source = 'cloud';
+  } else if (localNodes.length > 0) {
+    result.result_source = 'local';
+  }
+
+  if (localNodes.length >= 2) result.double_checked = true;
+  return result;
+}
+
+/**
+ * 从执行结果中提取云端用量与总耗时。
+ * @param {object} outcome 执行结果
+ * @returns {{cloudUsage: object|null, elapsedMs: number}}
+ */
+function outcomeMetrics(outcome) {
+  const okCloud = outcome.nodeResults.find((r) => r.ref === 'builtin.cloudModel' && r.status === 'ok');
+  const cloudUsage = okCloud && okCloud.cloud ? okCloud.cloud.usage || null : null;
+  let elapsedMs = 0;
+  for (const r of outcome.nodeResults) elapsedMs = Math.max(elapsedMs, r.elapsedMs || 0);
+  return { cloudUsage, elapsedMs };
+}
+
+/**
+ * 文本审核流程执行（新引擎）。
+ * @param {string} text 文本
+ * @param {object} meta 元数据
+ * @param {object} options 选项
+ * @returns {Promise<object>} 审核结果
+ */
+async function runFlowText(text, meta = {}, options = {}) {
+  const strictness = options.strictness || config.moderation.strictness || 'standard';
+  const requestId = newRequestId();
+
+  const precheckResult = precheck(text);
+  const precheckHint = buildPrecheckHint(precheckResult);
+  if (precheckResult.hasHit) logInfo('precheck', `敏感词预检命中: ${precheckResult.hits.map((h) => h.word).join(', ')}`);
+
+  const channels = config.moderation.reviewChannels || { local: true, cloud: true, contentSafety: false, disputeStrategy: 'highest' };
+  const csStatus = getContentSafetyStatus();
+  const contentSafetyPromise = (channels.contentSafety && csStatus.ready) ? moderateTextContentSafety(text) : null;
+
+  const model = options.model || config.ollama.textModel;
+  const cc = crossCheckConfig();
+  const prompt = buildTextPrompt({ text, precheckHint, model });
+  if (prompt.neutralized) logWarn('moderator', '[prompt-fence] 待审核文本中出现定界符逃逸尝试，已中和（不计为合法内容）');
+
+  // 旧开关若在运行期被改动（直接改 config 或环境变量），拓扑可能已陈旧 → 按当前开关重建
+  flowModule.migrate.syncIfStale(config);
+  const selected = flowModule.getValidFlow(config, 'text');
+  if (!selected.flow) {
+    logWarn('moderator', `文本流程不可用，回退旧引擎（${selected.validation.errors.map((e) => e.code).join(',') || 'unknown'}）`);
+    return legacyModerateText(text, meta, options);
+  }
+  const ctx = flowModule.context.createContext({ modality: 'text', payload: { text }, meta, requestId, strictness });
+  const outcome = await flowModule.runFlow(selected.flow, { text }, {
+    ctx, modality: 'text', strictness, requestId, precheckHint, signal: options.signal,
+  });
+  logInfo('moderator', `流程执行(text): status=${outcome.status}, 节点=${outcome.nodeResults.length}`);
+
+  const contentSafetyResult = await contentSafetyPromise;
+  const csApplied = Boolean(contentSafetyResult && contentSafetyResult.available && !contentSafetyResult.skipped);
+
+  const applyCrossCheck = (res, extra = {}) => {
+    const signals = injectionAudit.detectSignals({
+      riskLevel: res.risk_level,
+      categoryScores: res.category_scores,
+      precheckResult,
+      fenceNeutralized: prompt.neutralized,
+      ...extra,
+    });
+    injectionAudit.applySignals(res, signals, {
+      enabled: cc.enabled, minLevel: cc.minLevel, actionOf: getAction, isPassing: isPassingAction,
+    });
+    if (res.fail_closed) { res.passed = false; res.error = true; res.confidence = 0; }
+    return res;
+  };
+
+  // ── 情形 B：任一真实失败 → fail-closed（整体判定，不只看 trunk） ──
+  if (outcome.status === 'failed' || outcome.hasRealFailure) {
+    const fail = outcome.failed[0] || {};
+    const failureType = fail.failureType || FAILURE_TYPE.UNKNOWN;
+    const res = {
+      passed: false, action: 'review', risk_level: 'review',
+      categories: [], category_scores: {}, confidence: 0,
+      reason: 'AI 审核通道异常，未取得有效判定，已按失败-关闭策略拦截',
+      suggestion: 'AI 审核通道未能返回有效判定，已按失败-关闭策略拦截，请人工复核',
+      type: 'text', timestamp: new Date().toISOString(), error: true, strictness, ...meta,
+    };
+    if (precheckResult.hasHit) { res.precheck_hits = precheckResult.hits; applyPrecheckOverride(res, precheckResult, true, strictness); }
+    applyContentSafetyResult(res, contentSafetyResult);
+    logFailClosedWarning({ requestId, channels: outcome.failed.map((f) => f.ref || f.nodeId), failureType, rawSnippet: '' });
+    applyFailClosed(res, {
+      reason: 'AI 审核通道异常，未取得有效判定，已按失败-关闭策略拦截',
+      failureType, strictness, requestId,
+    });
+    applyCrossCheck(res, { canaryMissing: failureType === 'unsafe' });
+    attachChannelStatus(res, buildChannelStatus(deriveChannelState(outcome, 'text', csApplied)));
+    res.node_traces = outcome.traces;
+    res.request_id = requestId;
+    res.model = model;
+    logModeration(res);
+    saveAuditRecord(text, res, meta);
+    return res;
+  }
+
+  // ── 情形 A：全部 skipped → 合法降级 ──
+  if (outcome.status === 'skipped') {
+    warnDegradedModeOnce();
+    const res = {
+      passed: true, action: 'pass_log', risk_level: 'low',
+      categories: [], category_scores: {}, confidence: 0,
+      reason: '未配置可用的 AI 审核通道（本地模型 / 云端大模型 / 内容安全均未配置），结论仅基于敏感词预检',
+      suggestion: '未启用任何 AI 通道，当前结论仅基于敏感词预检；建议配置云端或本地模型以获得完整审核',
+      type: 'text', timestamp: new Date().toISOString(), error: false, strictness, ...meta,
+    };
+    if (precheckResult.hasHit) { res.precheck_hits = precheckResult.hits; applyPrecheckOverride(res, precheckResult, true, strictness); }
+    applyContentSafetyResult(res, contentSafetyResult);
+    applyCrossCheck(res);
+    attachChannelStatus(res, buildChannelStatus(deriveChannelState(outcome, 'text', csApplied)));
+    res.node_traces = outcome.traces;
+    res.request_id = requestId;
+    res.model = model;
+    logModeration(res);
+    saveAuditRecord(text, res, meta);
+    return res;
+  }
+
+  // ── 正常路径：有 ok 判定 ──
+  const result = buildResult(outcome.verdict, 'text', meta);
+  result.strictness = strictness;
+  const okLocal = outcome.nodeResults.find((r) => r.ref === 'builtin.localModel' && r.status === 'ok');
+  const okCloud = outcome.nodeResults.find((r) => r.ref === 'builtin.cloudModel' && r.status === 'ok');
+
+  if (precheckResult.hasHit) {
+    result.precheck_hits = precheckResult.hits;
+    applyPrecheckOverride(result, precheckResult, false, strictness);
+  }
+  applyContentSafetyResult(result, contentSafetyResult);
+  applyCrossCheck(result, {
+    localRisk: okLocal ? okLocal.verdict.risk_level : '',
+    cloudRisk: okCloud ? okCloud.verdict.risk_level : '',
+  });
+  projectCompat(result, outcome, model);
+  attachChannelStatus(result, buildChannelStatus(deriveChannelState(outcome, 'text', csApplied)));
+  result.node_traces = outcome.traces;
+
+  logModeration(result);
+
+  const { cloudUsage, elapsedMs } = outcomeMetrics(outcome);
+  result.model = (result.result_source === 'cloud' && result.cloud_model) ? result.cloud_model : model;
+  result.latency_ms = elapsedMs;
+  if (cloudUsage) {
+    result.tokens_in = cloudUsage.prompt_tokens;
+    result.tokens_out = cloudUsage.completion_tokens;
+  } else {
+    result.tokens_in = Math.round(text.length * 1.8);
+    result.tokens_out = Math.round((result.reason ? result.reason.length : 0) * 1.5);
+  }
+  saveAuditRecord(text, result, meta);
+  return result;
+}
+
+/**
+ * 图片审核流程执行（新引擎；含终裁层显式化）。
+ * @param {string} imageBase64 base64 图片
+ * @param {string} text 附带文字
+ * @param {object} meta 元数据
+ * @returns {Promise<object>} 审核结果
+ */
+async function runFlowImage(imageBase64, text = '', meta = {}) {
+  const strictness = meta.strictness || config.moderation.strictness || 'standard';
+  const requestId = newRequestId();
+
+  const channels = config.moderation.reviewChannels || { local: true, cloud: true, contentSafety: false, disputeStrategy: 'highest' };
+  const csStatus = getContentSafetyStatus();
+  const contentSafetyPromise = (channels.contentSafety && csStatus.ready) ? moderateImageContentSafety(imageBase64, text) : null;
+
+  // 旧开关若在运行期被改动，拓扑可能已陈旧 → 按当前开关重建
+  flowModule.migrate.syncIfStale(config);
+  const selected = flowModule.getValidFlow(config, 'image');
+  if (!selected.flow) {
+    logWarn('moderator', `图像流程不可用，回退旧引擎（${selected.validation.errors.map((e) => e.code).join(',') || 'unknown'}）`);
+    return legacyModerateImage(imageBase64, text, meta);
+  }
+
+  const ctx = flowModule.context.createContext({ modality: 'image', payload: { imageBase64, caption: text }, meta, requestId, strictness });
+  const outcome = await flowModule.runFlow(selected.flow, { imageBase64, caption: text }, {
+    ctx, modality: 'image', strictness, requestId,
+  });
+  logInfo('moderator', `流程执行(image): status=${outcome.status}, 节点=${outcome.nodeResults.length}`);
+
+  const contentSafetyResult = await contentSafetyPromise;
+  const csApplied = Boolean(contentSafetyResult && contentSafetyResult.available && !contentSafetyResult.skipped);
+  const model = config.ollama.visionModel;
+
+  if (outcome.status === 'failed' || outcome.hasRealFailure) {
+    const fail = outcome.failed[0] || {};
+    const failureType = fail.failureType || FAILURE_TYPE.NETWORK;
+    const res = {
+      passed: false, action: 'review', risk_level: 'review',
+      categories: [], category_scores: {}, confidence: 0,
+      reason: 'AI 审核通道异常，未取得有效判定，已按失败-关闭策略拦截',
+      suggestion: 'AI 审核通道未能返回有效判定，已按失败-关闭策略拦截，请人工复核',
+      type: 'image', timestamp: new Date().toISOString(), error: true, model, ...meta,
+    };
+    logFailClosedWarning({ requestId, channels: outcome.failed.map((f) => f.ref || f.nodeId), failureType, rawSnippet: '' });
+    applyContentSafetyResult(res, contentSafetyResult);
+    applyFailClosed(res, { reason: 'AI 审核通道异常，未取得有效判定，已按失败-关闭策略拦截', failureType, strictness, requestId });
+    applyImageSignals(res);
+    attachChannelStatus(res, buildChannelStatus(deriveChannelState(outcome, 'image', csApplied)));
+    res.node_traces = outcome.traces;
+    res.request_id = requestId;
+    logModeration(res);
+    saveAuditRecord('[图片审核]', res, meta);
+    return res;
+  }
+
+  if (outcome.status === 'skipped') {
+    const res = {
+      passed: true, action: 'pass_log', risk_level: 'low',
+      categories: [], category_scores: {}, confidence: 0,
+      reason: '未配置可用的图片审核通道，已跳过',
+      suggestion: '未配置可用的图片审核通道，建议配置本地视觉模型或云端视觉模型',
+      type: 'image', timestamp: new Date().toISOString(), error: false, ...meta,
+    };
+    applyContentSafetyResult(res, contentSafetyResult);
+    attachChannelStatus(res, buildChannelStatus(deriveChannelState(outcome, 'image', csApplied)));
+    res.node_traces = outcome.traces;
+    logModeration(res);
+    saveAuditRecord('[图片审核]', res, meta);
+    return res;
+  }
+
+  const result = buildResult(outcome.verdict, 'image', meta, strictness);
+  result.model = model;
+  result.strictness = strictness;
+  applyContentSafetyResult(result, contentSafetyResult);
+  applyImageSignals(result);
+  await flowModule.runFinalizers(selected.flow, result, ctx);
+  projectCompat(result, outcome, model);
+  attachChannelStatus(result, buildChannelStatus(deriveChannelState(outcome, 'image', csApplied)));
+  result.node_traces = ctx.traces;
+
+  const { elapsedMs } = outcomeMetrics(outcome);
+  result.latency_ms = elapsedMs;
+  logModeration(result);
+  saveAuditRecord('[图片审核]', result, meta);
+  return result;
+}
+
+// ─── 对外入口（分发：新引擎 / 旧引擎逃生舱） ───
+
+/**
+ * 审核文本内容。
+ * @param {string} text 待审核文本
+ * @param {object} meta 元数据
+ * @param {object} options 选项 { strictness, model }
+ * @returns {Promise<object>} 审核结果
+ */
+async function moderateText(text, meta = {}, options = {}) {
+  if (!text || !text.trim()) {
+    return {
+      passed: true, action: 'pass', risk_level: 'safe',
+      categories: [], confidence: 1.0, reason: '空文本', suggestion: '无需审核',
+      type: 'text', timestamp: new Date().toISOString(), ...meta,
+    };
+  }
+  if (!flowsEnabled()) return legacyModerateText(text, meta, options);
+  try {
+    return await runFlowText(text, meta, options);
+  } catch (err) {
+    logError('moderator', `流程执行(text)异常，回退旧引擎: ${err.message}`);
+    return legacyModerateText(text, meta, options);
+  }
+}
+
+/**
+ * 审核图片内容（支持附带文字）。
+ * @param {string} imageBase64 base64 图片
+ * @param {string} text 附带文字
+ * @param {object} meta 元数据
+ * @returns {Promise<object>} 审核结果
+ */
+async function moderateImage(imageBase64, text = '', meta = {}) {
+  if (!imageBase64) {
+    return {
+      passed: true, action: 'pass', risk_level: 'safe',
+      categories: [], confidence: 1.0, reason: '无图片内容', suggestion: '无需审核',
+      type: 'image', timestamp: new Date().toISOString(), ...meta,
+    };
+  }
+  if (!flowsEnabled()) return legacyModerateImage(imageBase64, text, meta);
+  try {
+    return await runFlowImage(imageBase64, text, meta);
+  } catch (err) {
+    logError('moderator', `流程执行(image)异常，回退旧引擎: ${err.message}`);
+    return legacyModerateImage(imageBase64, text, meta);
+  }
+}
+
+module.exports = {
+  moderateText,
+  moderateImage,
+  moderateImageLocal,
+  moderate,
+  healthCheck,
+  // v2.2.0 内部导出（供流程 API / 测试使用）
+  legacyModerateText,
+  legacyModerateImage,
+  flowsEnabled,
+};

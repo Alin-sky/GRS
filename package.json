@@ -1,6 +1,6 @@
 {
   "name": "qq-bot-moderator",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "面向 QQ / Koishi 机器人的多通道 AI 内容审核系统：本地 Ollama、云端大模型、阿里云内容安全，含提示词注入防御与敏感词预检兜底；所有 AI 通道均为可选",
   "main": "src/server.js",
   "scripts": {
@@ -12,6 +12,9 @@
     "lint:plugins": "node scripts/lint-plugin-boundary.js",
     "test:injection": "node scripts/test-injection.js",
     "test:conflicts": "node scripts/test-config-conflicts.js",
+    "test:flow-merge": "node scripts/test-flow-merge.js",
+    "test:flow-validate": "node scripts/test-flow-validate.js",
+    "test:flow-executor": "node scripts/test-flow-executor.js",
     "test:e2e": "node scripts/e2e-regression.js",
     "check:publish": "node scripts/pre-publish-check.js"
   },
@@ -28,11 +31,13 @@
     "node": ">=20.9.0"
   },
   "dependencies": {
-    "@alicloud/green20220302": "^3.4.1",
     "busboy": "^1.6.0",
     "cordis": "4.0.0-rc.9",
     "express": "^4.21.0",
     "pinyin-pro": "^3.28.2",
     "sharp": "^0.35.3"
+  },
+  "optionalDependencies": {
+    "@alicloud/green20220302": "^3.4.1"
   }
 }

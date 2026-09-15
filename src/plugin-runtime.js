@@ -98,6 +98,7 @@ async function init(options = {}) {
   broker.setTransport({
     emitCollect: bridge.emitCollect,
     emitFirst: bridge.emitFirst,
+    emitCall: bridge.emitCall,
     hasHandlers: bridge.hasHandlers,
   });
   // 插件返回值 gate 的拒绝事件落日志（后续可接 src/security 审计）
@@ -138,6 +139,18 @@ async function init(options = {}) {
   // ④ 宿主路由代理转 ready（/api/p/* 由 503 转为可服务）
   pluginHost.setPhase('ready');
   _initialized = true;
+
+  // ⑤ v2.2.0：插件装载后把终裁层显式化到图像拓扑（坑①：wd14 linkage 可见、可禁用、进 trace）
+  try {
+    const flow = require('./flow');
+    flow.ensureBuiltins();
+    const rec = flow.reconcileFinalizers(config);
+    // 仅内存生效：不在此处落盘，避免启动即改写用户 config/default.json；
+    // 持久化交由显式写操作（PUT /api/flow/:modality）负责，每次启动按需重建，结果一致。
+    if (rec.changed) logInfo('plugin-runtime', `已把终裁层显式化到图像拓扑: ${rec.added.join(', ')}`);
+  } catch (err) {
+    logError('plugin-runtime', `终裁层对齐失败（不影响主链路）: ${err.message}`);
+  }
 
   const providerCount = broker.providers().length;
   logInfo('plugin-runtime', `插件系统就绪：扫描 ${scan.plugins.length} 个，启用 ${loaded} 个，注册能力 ${providerCount} 项${status.degraded ? '（降级模式）' : ''}`);

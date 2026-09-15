@@ -152,6 +152,22 @@ function loadConfig() {
   cachedConfig = deepMerge(DEFAULT_CONFIG, raw);
   applyEnvOverrides(cachedConfig);
 
+  // v2.2.0：旧配置 → 默认拓扑（幂等；不删除任何旧字段，保证 flows.enabled=false 逃生可用）
+  try {
+    const flowMigrate = require('./flow/migrate');
+    const migration = flowMigrate.ensureFlows(cachedConfig);
+    for (const entry of migration.log) {
+      cfgLog(entry.level === 'warn' ? 'warn' : 'info', `[${entry.code}] ${entry.msg}`);
+    }
+    if (migration.migrated) {
+      cfgLog('info', '已从旧开关生成默认审核拓扑（moderation.flows.text / .image）');
+    }
+  } catch (err) {
+    cfgLog('error', `审核流程迁移失败（将回退旧引擎）: ${err.message}`);
+  }
+
+  void origin;
+
   // 选项冲突治理（架构 §4）：检测 → 打日志 → 施加自动修正 → 缓存报告供 /health 暴露
   const conflictResult = detectConflicts(cachedConfig, { isValueSet, log: cfgLog });
   cachedConflicts = conflictResult.reports;

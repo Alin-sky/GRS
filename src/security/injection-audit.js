@@ -37,7 +37,8 @@ const CONFLICT_SIGNALS = new Set([
   SIGNAL_CODES.C4,
 ]);
 
-const RISK_ORDER = { safe: 0, low: 1, medium: 2, review: 2.5, high: 3, critical: 4 };
+// ★ R0：风险序唯一来源（src/flow/risk.js）。本文件不再自行定义。
+const { RISK_ORDER, riskOrder } = require('../flow/risk');
 
 /** 进程内计数器（重启清零，仅用于运营观测，非安全边界）。 */
 let counters = {
@@ -45,15 +46,6 @@ let counters = {
   suspicious: 0,
   by_signal: {},
 };
-
-/**
- * 取风险等级序值，未知等级按 0 处理。
- * @param {string} level 风险等级
- * @returns {number} 序值
- */
-function riskOrder(level) {
-  return RISK_ORDER[level] ?? 0;
-}
 
 /**
  * 取预检命中的最高等级序值。

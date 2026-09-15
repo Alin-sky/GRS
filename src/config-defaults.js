@@ -97,6 +97,12 @@ const DEFAULT_THRESHOLDS = {
   grotesque: { enabled: true, logThreshold: 40, blockThreshold: 70 },
 };
 
+/**
+ * 风险等级 → 动作/说明 映射。
+ * 注意：这里的 `score` 与 `src/flow/risk.js` 的 `RISK_ORDER` 采用同一阶梯
+ * （safe 0 < low 1 < medium 2 < review 3 < high 4 < critical 5）。
+ * ★ 序位比较的唯一来源是 `src/flow/risk.js`，本表仅承载界面文案与动作映射，请勿在其上做比较。
+ */
 const DEFAULT_RISK_LEVELS = {
   safe: { score: 0, action: 'pass', description: '内容安全，无违规风险' },
   low: { score: 1, action: 'pass_log', description: '存在轻微风险，放行但记录日志' },
@@ -213,6 +219,14 @@ const DEFAULT_CONFIG = {
       cloud: true,
       contentSafety: false,
       disputeStrategy: 'highest',
+    },
+    // v2.2.0 审核流程（DAG 拓扑）。
+    //   enabled=true  → 使用 src/flow/* 执行器（默认；行为等价 v2.1.0）
+    //   enabled=false → 回退 v2.1.0 旧硬编码分支（@deprecated，保留至 v2.3.0）
+    // flows.text / flows.image 由 src/flow/migrate.js 在首次加载时从旧开关迁移生成，
+    // 此处只声明总开关，避免把体积较大的拓扑写进默认模板。
+    flows: {
+      enabled: true,
     },
     thresholds: DEFAULT_THRESHOLDS,
     riskLevels: DEFAULT_RISK_LEVELS,

@@ -7,6 +7,8 @@ const { logInfo, logError } = require('./logger');
 const { precheck, buildPrecheckHint } = require('./precheck');
 const { moderateTextCloud } = require('./qwen_cloud');
 const { moderateTextContentSafety } = require('./content_safety');
+// ★ R0：风险序唯一来源（src/flow/risk.js）。
+const { RISK_ORDER } = require('./flow/risk');
 
 const config = loadConfig();
 const COMPARISON_DIR = path.join(getProjectRoot(), 'data', 'comparisons');
@@ -165,7 +167,8 @@ function isErrorResult(result) {
  * @returns {object} 对比结果
  */
 function compareResults(resultA, resultB, labelA, labelB) {
-  const riskOrder = { safe: 0, low: 1, medium: 2, high: 3, critical: 4 };
+  // ★ R0：风险序唯一来源（src/flow/risk.js）。
+  const riskOrder = RISK_ORDER;
 
   const riskChanged = resultA.risk_level !== resultB.risk_level;
   const catsA = new Set(resultA.categories || []);

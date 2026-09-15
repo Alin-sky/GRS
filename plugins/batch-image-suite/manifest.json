@@ -20,6 +20,10 @@
 
   "contributes": {
     "config": { "schemaResolver": "configSchema" },
+
+    "// flowRole": "task = 任务型插件：不提供审核判定能力，注册表层直接排除，不出现在画布节点面板（架构 §8.6 / 坑②）",
+    "flowRole": "task",
+
     "capabilities": [],
     "commands": [
       { "id": "resumeLast", "title": "继续上次任务", "rpc": "task.resume" }

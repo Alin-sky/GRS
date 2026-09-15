@@ -191,11 +191,31 @@ class BridgeContext {
    * @returns {any|undefined} 服务实现
    */
   inject(key, required = true) {
+    // ★ v1.1：受控服务按插件 id 绑定（secrets 白名单 / precheck 词库不出库）
+    if (key === 'secrets') return this.secrets;
+    if (key === 'precheck') {
+      const svc = (this.host && this.host.precheck) || null;
+      if (!svc && required) throw new Error(`插件 ${this._name} 依赖的服务未提供: precheck`);
+      return svc || { match: () => ({ hit: false, category: '', level: '' }) };
+    }
     const value = typeof this._ctx.get === 'function' ? this._ctx.get(key, false) : this._ctx[key];
     if (value === undefined && required) {
       throw new Error(`插件 ${this._name} 依赖的服务未提供: ${key}`);
     }
     return value;
+  }
+
+  /**
+   * 受控密钥访问器（按插件 id 绑定白名单）。
+   * @returns {{get: (configPath: string) => string|null, grantsOf: Function}}
+   */
+  get secrets() {
+    const svc = (this.host && this.host.secrets) || null;
+    if (!svc) return { get: () => null, grantsOf: () => [] };
+    return {
+      get: (configPath) => svc.get(this._name, configPath),
+      grantsOf: () => svc.grantsOf(this._name),
+    };
   }
 
   /**
@@ -242,6 +262,17 @@ class BridgeContext {
    */
   async emitFirst(event, ...args) {
     return emitFirst(event, ...args);
+  }
+
+  /**
+   * 点对点调用模式：只执行 owner 匹配的处理器（v1.1）。
+   * @param {string} event 事件名
+   * @param {string} owner 目标插件 id
+   * @param {...any} args 参数
+   * @returns {Promise<any>}
+   */
+  async emitCall(event, owner, ...args) {
+    return emitCall(event, owner, ...args);
   }
 
   /**
@@ -392,15 +423,53 @@ class FallbackBridgeContext {
 
   provide(key, impl, lifecycle = null) { return this._legacy.provide(key, impl, lifecycle || {}); }
 
-  inject(key, required = true) { return this._legacy.inject(key, required); }
+  inject(key, required = true) {
+    if (key === 'secrets') return this.secrets;
+    if (key === 'precheck') return (_host && _host.precheck) || { match: () => ({ hit: false, category: '', level: '' }) };
+    return this._legacy.inject(key, required);
+  }
 
-  on(event, handler, options = {}) { this._legacy.on(event, handler, options || {}); return this; }
+  /** 受控密钥访问器（降级路径同样按插件 id 绑定白名单）。 */
+  get secrets() {
+    const svc = (_host && _host.secrets) || null;
+    if (!svc) return { get: () => null, grantsOf: () => [] };
+    return {
+      get: (configPath) => svc.get(this._name, configPath),
+      grantsOf: () => svc.grantsOf(this._name),
+    };
+  }
 
-  before(event, handler) { this._legacy.before(event, handler); return this; }
+  /**
+   * 注册钩子（★ 降级模式同样登记到桥接层**带 owner** 的有序表，
+   * 否则 emitCall 无法按 owner 点对点定位 —— 会把结论挂到错误的 ref 上）。
+   * @param {string} event 事件名
+   * @param {Function} handler 处理器
+   * @param {{order?: number}} [options] 选项
+   * @returns {FallbackBridgeContext} this
+   */
+  on(event, handler, options = {}) {
+    _addHandler(_handlers, event, handler, options.order ?? 0, this._name);
+    this._legacy.on(event, handler, options || {});
+    return this;
+  }
 
-  async emitCollect(event, ...args) { return this._legacy.emitCollect(event, ...args); }
+  /**
+   * 注册前置钩子（同样带 owner 登记）。
+   * @param {string} event 事件名
+   * @param {Function} handler 处理器
+   * @returns {FallbackBridgeContext} this
+   */
+  before(event, handler) {
+    _addHandler(_before, event, handler, 0, this._name);
+    this._legacy.before(event, handler);
+    return this;
+  }
 
-  async emitFirst(event, ...args) { return this._legacy.emitFirst(event, ...args); }
+  async emitCollect(event, ...args) { return emitCollect(event, ...args); }
+
+  async emitFirst(event, ...args) { return emitFirst(event, ...args); }
+
+  async emitCall(event, owner, ...args) { return emitCall(event, owner, ...args); }
 
   config(schema) { return this._legacy.config(schema); }
 
@@ -544,19 +613,21 @@ async function _runBefore(event, args) {
  * @returns {Promise<Array<any>>}
  */
 async function emitCollect(event, ...args) {
-  if (_degraded && _fallback) {
-    try {
-      return await _fallback.hook(event).runCollect(...args);
-    } catch (err) {
-      logError('cordis-bridge', `降级模式事件 ${event} 触发异常: ${err.message}`);
-      return [];
-    }
-  }
   const short = await _runBefore(event, args);
   if (short.has) return [short.value];
 
   const list = [...(_handlers.get(event) || [])];
-  if (list.length === 0) return [];
+  if (list.length === 0) {
+    // 安全网：降级模式下若插件经非 ctx 路径登记（未进桥接表），回落到旧引擎
+    if (_degraded && _fallback) {
+      try {
+        return await _fallback.hook(event).runCollect(...args);
+      } catch (err) {
+        logError('cordis-bridge', `降级模式事件 ${event} 触发异常: ${err.message}`);
+      }
+    }
+    return [];
+  }
   const results = new Array(list.length);
   await Promise.all(list.map(async (h, i) => {
     try {
@@ -576,7 +647,11 @@ async function emitCollect(event, ...args) {
  * @returns {Promise<any>}
  */
 async function emitFirst(event, ...args) {
-  if (_degraded && _fallback) {
+  const short = await _runBefore(event, args);
+  if (short.has) return short.value;
+
+  const list = [...(_handlers.get(event) || [])];
+  if (list.length === 0 && _degraded && _fallback) {
     try {
       return await _fallback.hook(event).runFirst(...args);
     } catch (err) {
@@ -584,10 +659,7 @@ async function emitFirst(event, ...args) {
       return undefined;
     }
   }
-  const short = await _runBefore(event, args);
-  if (short.has) return short.value;
-
-  for (const h of [...(_handlers.get(event) || [])]) {
+  for (const h of list) {
     try {
       const r = await h.fn(...args);
       if (r !== undefined && r !== null) return r;
@@ -601,6 +673,33 @@ async function emitFirst(event, ...args) {
 /** 某事件是否有主处理器 */
 function hasHandlers(event) {
   return (_handlers.get(event) || []).length > 0;
+}
+
+/**
+ * 点对点调用模式（v1.1）：只执行 owner 匹配的处理器，首个非空返回即结果。
+ * owner 省略时退化为按 order 顺序的 emitFirst 语义。
+ * @param {string} event 事件名
+ * @param {string} owner 目标插件 id（点对点定位）
+ * @param {...any} args 参数
+ * @returns {Promise<any>} 首个非空返回值，或 undefined
+ */
+async function emitCall(event, owner, ...args) {
+  const short = await _runBefore(event, args);
+  if (short.has) return short.value;
+
+  const list = [...(_handlers.get(event) || [])];
+  // ★ 点对点语义：只执行 owner 匹配的处理器；**绝不回落 runFirst**（那会把结论挂到错误的 ref 上）。
+  //   无匹配 → 返回 undefined，交由 capability-broker/执行器记为 plugin_rejected / skipped。
+  for (const h of list) {
+    if (!owner || h.owner !== owner) continue;
+    try {
+      const r = await h.fn(...args);
+      if (r !== undefined && r !== null) return r;
+    } catch (err) {
+      logError('cordis-bridge', `事件 ${event} 点对点处理器异常（${h.owner}）: ${err.message}`);
+    }
+  }
+  return undefined;
 }
 
 // ─── 插件定义解析与包装 ───
@@ -703,6 +802,9 @@ async function initBridge(options = {}) {
     _root.provide('vision', _host.vision);
     _root.provide('fs', _host.fs);
     _root.provide('hostServices', _host);
+    // ★ v1.1：受控注入项（密钥白名单下发 + 词库不出库判定）
+    _root.provide('secrets', _host.secrets);
+    _root.provide('precheck', _host.precheck);
     _phase = 'ready';
     logInfo('cordis-bridge', `cordis ${_cordisVersion || '未知版本'} 加载成功，宿主 v${HOST_VERSION} 服务已注入`);
   } catch (err) {
@@ -931,6 +1033,7 @@ module.exports = {
   markError,
   emitCollect,
   emitFirst,
+  emitCall,
   hasHandlers,
   resolveDef,
   resolveSchema,

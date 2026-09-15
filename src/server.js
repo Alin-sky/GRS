@@ -21,6 +21,9 @@ const { startBatchScan, getTaskStatus, getTaskResults, getTaskImage, getTaskThum
 const { healthCheckCloud } = require('./qwen_cloud');
 const { getContentSafetyStatus } = require('./content_safety');
 const injectionAudit = require('./security/injection-audit');
+// ★ v2.2.0 编排层（画布 UI 与插件对接的唯一后端接口）
+const flowModule = require('./flow');
+const flowMigrate = require('./flow/migrate');
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -1046,6 +1049,8 @@ app.put('/api/dual-mode', requireAdminPassword, async (req, res) => {
       if (typeof tokenPlanTimeout === 'number') config.tokenPlan.timeout = tokenPlanTimeout;
     }
 
+    // ★ v2.2.0（F17）：dualMode 为派生视图——写操作重定向到拓扑
+    regenerateFlows();
     const { saveConfig } = require('./config');
     saveConfig();
 
@@ -1077,13 +1082,50 @@ app.get('/api/content-safety/status', (req, res) => {
   res.json(getContentSafetyStatus());
 });
 
-// ─── 三审通道配置 ───
+// ─── 三审通道配置（v2.2.0：派生视图，读从拓扑反算，写重定向到拓扑）───
 app.get('/api/review-channels', (req, res) => {
   res.json({
     ...(config.moderation.reviewChannels || { local: true, cloud: true, contentSafety: false, disputeStrategy: 'highest' }),
     contentSafetyStatus: getContentSafetyStatus(),
+    // 拓扑派生摘要（供画布与旧面板同步显示）
+    flows: describeFlows(),
   });
 });
+
+/**
+ * 从拓扑反算旧的通道开关（派生视图，供 GET /api/review-channels 展示）。
+ * @returns {object} 反算结果
+ */
+function describeFlows() {
+  const out = {};
+  for (const modality of ['text', 'image']) {
+    const flow = flowModule.getFlow(config, modality);
+    if (!flow) { out[modality] = { present: false }; continue; }
+    const path = new Set();
+    const nodes = flow.nodes || [];
+    const edges = flow.edges || [];
+    const inputId = (nodes.find((n) => n && n.type === 'input') || {}).id;
+    const outputId = (nodes.find((n) => n && n.type === 'output') || {}).id;
+    const adj = new Map(); const radj = new Map();
+    for (const n of nodes) if (n && n.id) { adj.set(n.id, []); radj.set(n.id, []); }
+    for (const e of edges) if (adj.has(e.from) && adj.has(e.to)) { adj.get(e.from).push(e.to); radj.get(e.to).push(e.from); }
+    const walk = (start, g) => { const s = new Set(); const st = start ? [start] : []; while (st.length) { const id = st.pop(); if (s.has(id)) continue; s.add(id); for (const x of g.get(id) || []) st.push(x); } return s; };
+    const fwd = walk(inputId, adj); const back = walk(outputId, radj);
+    for (const id of fwd) if (back.has(id)) path.add(id);
+    const connected = nodes.filter((n) => n && path.has(n.id)).map((n) => n.ref);
+    const merge = nodes.find((n) => n && path.has(n.id) && n.type === 'merge');
+    out[modality] = {
+      present: true,
+      revision: flow.revision,
+      local: connected.includes('builtin.localModel'),
+      cloud: connected.includes('builtin.cloudModel'),
+      contentSafety: (flow.floors || []).some((f) => f.ref === 'builtin.contentSafety' && f.enabled !== false),
+      strategy: merge ? merge.strategy : 'single',
+      finalizers: (flow.finalizers || []).map((f) => f.ref),
+    };
+  }
+  return out;
+}
 
 app.put('/api/review-channels', requireAdminPassword, (req, res) => {
   try {
@@ -1094,9 +1136,11 @@ app.put('/api/review-channels', requireAdminPassword, (req, res) => {
     if (typeof contentSafety === 'boolean') config.moderation.reviewChannels.contentSafety = contentSafety;
     const validStrategies = ['highest', 'local', 'cloud', 'contentSafety', 'majority'];
     if (validStrategies.includes(disputeStrategy)) config.moderation.reviewChannels.disputeStrategy = disputeStrategy;
+    // ★ v2.2.0（F17）：旧开关为派生视图——写操作重定向到拓扑，由拓扑重新生成
+    regenerateFlows();
     const { saveConfig } = require('./config');
     saveConfig();
-    logInfo('server', `三审通道已更新: local=${config.moderation.reviewChannels.local}, cloud=${config.moderation.reviewChannels.cloud}, safety=${config.moderation.reviewChannels.contentSafety}, dispute=${config.moderation.reviewChannels.disputeStrategy}`);
+    logInfo('server', `三审通道已更新并重建拓扑: local=${config.moderation.reviewChannels.local}, cloud=${config.moderation.reviewChannels.cloud}, safety=${config.moderation.reviewChannels.contentSafety}, dispute=${config.moderation.reviewChannels.disputeStrategy}`);
     res.json({ success: true, ...config.moderation.reviewChannels });
   } catch (err) {
     res.status(500).json({ error: '更新三审配置失败', message: err.message });
@@ -1596,6 +1640,131 @@ app.get('/api/batch/thumb/:taskId/:index', async (req, res) => {
   res.setHeader('Content-Type', thumb.contentType);
   res.setHeader('Cache-Control', 'public, max-age=3600');
   res.send(thumb.buffer);
+});
+
+// ═══════════════════════════════════════════
+// v2.2.0 审核流程（DAG 编排）API
+// ═══════════════════════════════════════════
+
+/** 能力/节点注册表快照（画布面板的唯一数据源）。 */
+app.get('/api/flow/capabilities', async (req, res) => {
+  const modality = req.query.modality && ['text', 'image'].includes(req.query.modality) ? req.query.modality : undefined;
+  // 拉取前刷新一次插件就绪度（依据 manifest.readinessRpc），保证 ready/notReadyReason 实时
+  try {
+    const scanner = getScanner();
+    if (scanner && typeof scanner.refreshAllReadiness === 'function') await scanner.refreshAllReadiness();
+  } catch { /* 探测失败不影响快照返回 */ }
+  res.json(flowModule.snapshot(modality));
+});
+
+/** 从旧开关重新生成拓扑（写重定向用）。 */
+function regenerateFlows() {
+  if (!config.moderation.flows) config.moderation.flows = { enabled: true };
+  delete config.moderation.flows.text;
+  delete config.moderation.flows.image;
+  return flowMigrate.ensureFlows(config);
+}
+
+/** 校验并保存某模态流程。 */
+app.put('/api/flow/:modality', requireAdminPassword, (req, res) => {
+  const modality = req.params.modality;
+  if (!['text', 'image'].includes(modality)) {
+    return res.status(400).json({ ok: false, errors: [{ code: 'E001_SCHEMA', message: 'modality 必须为 text|image' }] });
+  }
+  const flow = req.body && req.body.flow ? req.body.flow : req.body;
+  const validation = flowModule.validateFlow(flow, flowModule.registry);
+  if (!validation.ok) {
+    // ★ 服务端是最终权威：有 error 则一行都不写
+    return res.status(400).json({ ok: false, errors: validation.errors, warnings: validation.warnings });
+  }
+  if (!config.moderation.flows) config.moderation.flows = { enabled: true };
+  const baseRevision = Number(req.body && req.body.baseRevision);
+  const current = config.moderation.flows[modality];
+  if (Number.isFinite(baseRevision) && current && Number.isFinite(current.revision) && baseRevision !== current.revision) {
+    return res.status(409).json({ ok: false, error: '配置已被其他地方修改', currentRevision: current.revision });
+  }
+  const saved = { ...flow, modality, revision: (current && Number.isFinite(current.revision) ? current.revision : 0) + 1, updatedAt: new Date().toISOString(), meta: { note: '', sourceOfTruth: true } };
+  config.moderation.flows[modality] = saved;
+  const { saveConfig } = require('./config');
+  saveConfig();
+  logInfo('server', `审核流程(${modality})已保存 revision=${saved.revision}`);
+  res.json({ ok: true, revision: saved.revision, warnings: validation.warnings });
+});
+
+/** 只校验不保存（前端即时提示，防抖调用）。 */
+app.post('/api/flow/:modality/validate', (req, res) => {
+  const flow = req.body && req.body.flow ? req.body.flow : req.body;
+  const validation = flowModule.validateFlow(flow, flowModule.registry);
+  res.json({ ok: validation.ok, errors: validation.errors, warnings: validation.warnings });
+});
+
+/** 读取某模态流程 + 校验结果。 */
+app.get('/api/flow/:modality', (req, res) => {
+  const modality = req.params.modality;
+  if (!['text', 'image'].includes(modality)) return res.status(400).json({ error: 'modality 必须为 text|image' });
+  const flow = flowModule.getFlow(config, modality);
+  if (!flow) return res.status(404).json({ error: `尚未生成 ${modality} 流程` });
+  const validation = flowModule.validateFlow(flow, flowModule.registry);
+  res.json({ ok: true, flow, errors: validation.errors, warnings: validation.warnings, enabled: flowModule.isEnabled(config) });
+});
+
+/** 试运行（dry-run）：用样例内容实跑，返回逐节点 trace（不落审计）。 */
+app.post('/api/flow/:modality/dry-run', requireAdminPassword, async (req, res) => {
+  const modality = req.params.modality;
+  if (!['text', 'image'].includes(modality)) return res.status(400).json({ error: 'modality 必须为 text|image' });
+  const selected = flowModule.getValidFlow(config, modality);
+  if (!selected.flow) {
+    return res.status(400).json({ ok: false, error: '流程不合法，无法试运行', errors: selected.validation.errors });
+  }
+  const sample = (req.body && req.body.sample) || {};
+  try {
+    const result = modality === 'text'
+      ? await moderateText(String(sample.text || ''), { skipAudit: true, dryRun: true }, {})
+      : await moderateImage(String(sample.imageBase64 || ''), String(sample.caption || ''), { skipAudit: true, dryRun: true });
+    res.json({ ok: true, verdict: result, node_traces: result.node_traces || [] });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+/** 重置为默认拓扑（由旧开关重新迁移生成）。 */
+app.post('/api/flow/:modality/reset', requireAdminPassword, (req, res) => {
+  const modality = req.params.modality;
+  if (!['text', 'image'].includes(modality)) return res.status(400).json({ error: 'modality 必须为 text|image' });
+  try {
+    regenerateFlows();
+    const flow = flowModule.getFlow(config, modality);
+    if (flow && !flowModule.isEnabled(config)) config.moderation.flows.enabled = true;
+    const { saveConfig } = require('./config');
+    saveConfig();
+    res.json({ ok: true, flow });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** 复制拓扑（文本 → 图像，自动剔除模态不匹配节点）。 */
+app.post('/api/flow/copy', requireAdminPassword, (req, res) => {
+  const from = req.body && req.body.from;
+  const to = req.body && req.body.to;
+  if (!['text', 'image'].includes(from) || !['text', 'image'].includes(to)) {
+    return res.status(400).json({ error: 'from/to 必须为 text|image' });
+  }
+  const src = flowModule.getFlow(config, from);
+  if (!src) return res.status(404).json({ error: `源流程 ${from} 不存在` });
+  const flowModuleRef = flowModule.registry;
+  const nodes = (src.nodes || []).filter((n) => {
+    if (!['service', 'contribute'].includes(n.type)) return true;
+    const d = flowModuleRef.get(n.ref);
+    return d ? d.modality.includes(to) : false;
+  });
+  const kept = new Set(nodes.map((n) => n.id));
+  const edges = (src.edges || []).filter((e) => kept.has(e.from) && kept.has(e.to));
+  const floors = (src.floors || []).filter((f) => {
+    const d = flowModuleRef.get(f.ref);
+    return !d || d.modality.includes(to);
+  });
+  res.json({ ok: true, flow: { ...src, modality: to, nodes, edges, floors, finalizers: to === 'image' ? (src.finalizers || []) : [] } });
 });
 
 // ─── Express 全局错误处理中间件（兜底：任何路由内抛出的异常都走这里，不崩服务） ───

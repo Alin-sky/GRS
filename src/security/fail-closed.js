@@ -13,6 +13,8 @@
 'use strict';
 
 const { FAILURE_CODES, isFailingCode } = require('./output-schema');
+// ★ R0：风险序唯一来源（src/flow/risk.js）。
+const { riskOrder } = require('../flow/risk');
 
 /** 动作严重程度（含 review）。 */
 const ACTION_ORDER = { pass: 0, pass_log: 1, review: 2, block: 3, block_alert: 4 };
@@ -93,8 +95,7 @@ function applyFailClosed(result, options = {}) {
   if ((ACTION_ORDER[result.action] || 0) < ACTION_ORDER[verdict.action]) {
     result.action = verdict.action;
   }
-  const riskOrder = { safe: 0, low: 1, medium: 2, review: 2.5, high: 3, critical: 4 };
-  if ((riskOrder[result.risk_level] ?? 0) < riskOrder[verdict.risk_level]) {
+  if (riskOrder(result.risk_level) < riskOrder(verdict.risk_level)) {
     result.risk_level = verdict.risk_level;
   }
 
